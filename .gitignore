@@ -11,7 +11,10 @@ wheels/
 
 # Local model weights and generated imaging artifacts
 checkpoints/*.ckpt
+checkpoints/manifest.json
 outputs/
+docs/
+.idea/
 *.nii
 *.nii.gz
-checkpoints/manifest.json
+
