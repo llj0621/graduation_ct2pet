@@ -25,6 +25,18 @@ graduation/
 uv sync
 ```
 
+### 确认使用项目的 uv 环境
+
+在包含 `pyproject.toml` 和 `uv.lock` 的项目根目录运行命令，使用 `uv run python`。uv 默认使用当前项目的 `.venv`，无需手动激活环境。可以先检查解释器、PyTorch 安装位置及版本：
+
+```bash
+uv run python -c "import sys,torch; print('Python:',sys.executable); print('Torch:',torch.__file__); print('Version:',torch.__version__)"
+```
+
+Linux/WSL 下，解释器应位于 `<项目目录>/.venv/bin/python`，PyTorch 应位于该 `.venv` 的 `site-packages`；Windows 下分别是 `<项目目录>\.venv\Scripts\python.exe` 和 `.venv\Lib\site-packages\torch`。以实际打印的路径确认使用了预期环境。详见 [uv 项目运行说明](https://docs.astral.sh/uv/concepts/projects/run/)。
+
+多卡启动也使用 `uv run python -m torch.distributed.run`。`torchrun` 默认用启动它的 `sys.executable` 创建各卡进程，因此各卡使用同一个项目环境，无需分别激活。环境变量 `PYTHON_EXEC` 可以覆盖子进程解释器；下面的 Linux/WSL 启动示例先用 `unset PYTHON_EXEC` 清除该覆盖。
+
 ## CT/PET latent 重建
 
 CT 与 PET 共用相同的单病例解码流程：读取一个病例的 latent，使用对应模态的 VQ codebook 和 decoder 还原影像，再从配对 NIfTI 继承空间坐标。默认输入为已配对 latent `ct.pt`、`pet.pt`，可分别用 `--case` 选择一例：
@@ -101,7 +113,7 @@ uv run python scripts/train_ct2pet.py --dry-run
 修改 `configs/train_ct2pet.json`。默认 W&B project 是 `ct2pet-cervical-cancer`，`wandb_entity=null` 使用登录账户的默认团队，`wandb_mode=online`。认证按 W&B 常规方式配置：
 
 ```powershell
-uv run wandb login
+uv run python -m wandb login --cloud
 uv run python scripts/train_ct2pet.py
 ```
 
@@ -109,7 +121,37 @@ W&B 和本地 `metrics.jsonl` 记录训练 v-loss、学习率、梯度范数、�
 
 配置 `reference_root` 时，还记录生成 PET 对实际配对 PET NIfTI 的 MAE、MSE、PSNR、轴位 SSIM，逐病例 W&B 表和三方向的真实/生成/误差图。参考 PET 仅用于评价，裁剪到 `[0,5]`；像素指标固定 data range=5，单位沿用源 PET 数据。参考尺寸必须与解码结果一致，不把 latent 的 VAE 重建当作真实 PET。生成像素指标仅覆盖配置中固定数量的病例，test diffusion loss 覆盖完整测试集；不能把这几个病例的生成指标视为全测试集的生成指标。
 
-模型采样、VAE 解码、W&B 图片上传比较耗时，可用 `validation_samples=0`、`test_samples=0` 关闭生成检查；`reference_root=null` 时只计算 latent 生成指标。默认 float32；CUDA 可以用 `--precision bfloat16` 或 `float16`。训练没有开始时配置错误会直接报出；数据合同、网络或优化器设置不匹配时拒绝续跑。
+默认 float32；CUDA 可以用 `--precision bfloat16` 或 `float16`。训练没有开始时配置错误会直接报出；数据合同、网络或优化器设置不匹配时拒绝续跑。
+
+#### 参考图像与生成检查的三个配置
+
+在 `configs/train_ct2pet.json` 中设置这三个字段：
+
+| 配置 | 含义 |
+| --- | --- |
+| `reference_root` | 原始配对 PET 图像的根目录，评价时读取 `<reference_root>/<case>/pet.nii.gz`。设置为 JSON 的 `null` 时不读取原始图像、不进行 VAE 图像解码和图像指标评价。 |
+| `validation_samples` | 每到 `sample_interval`，从验证集中选择固定数量的病例，从纯噪声完整采样 PET。设置为 `0` 时关闭这项生成检查。 |
+| `test_samples` | 正式训练完成后，使用最佳 EMA 为固定数量的测试病例完整采样 PET。设置为 `0` 时关闭这项生成检查。 |
+
+`reference_root` 不参与扩散训练 loss，也不是生成模型的输入条件。训练仍使用 `ct.pt/pet.pt`；`best.pt` 始终按验证集 `v_loss` 选择，不按 PET 图像指标选择。
+
+只把 `reference_root` 改为 `null`，保留非零 `validation_samples`、`test_samples` 时，仍会执行完整 DDPM 采样、保存生成的 `pet_pred.pt` 并记录生成 latent 的 MAE/MSE；只是没有 PET 图像 MAE/MSE、PSNR、SSIM 和真实/生成/误差对比图。提供图像目录时则额外加载固定的 PET VAE decoder，解码后与真实 PET 图像比较；参考图像尺寸必须与解码结果一致。生成指标仅覆盖选中的病例。
+
+如果只需要训练及验证/测试 loss，希望关闭完整生成检查，将对应三个字段改为：
+
+```json
+{
+  "reference_root": null,
+  "validation_samples": 0,
+  "test_samples": 0
+}
+```
+
+这是配置片段，请保留完整配置中的其他字段。使用 JSON 的 `null`，不要写成字符串 `"null"`。
+
+这组设置仍会记录训练 v-loss、验证/测试 diffusion loss、验证/测试的一步 x0 误差，正常保存 `best.pt`、`last.pt` 和定期 checkpoint，并支持断点续训；关闭的是从纯噪声开始的完整 PET 生成、生成 latent 指标和图像评价。原始图像不再是训练依赖，可以减少采样、VAE 解码及 W&B 图片记录的耗时。多卡训练中，生成评价由主进程执行，其他卡等待；关闭生成检查也会减少这段等待时间。
+
+若 `reference_root` 非 `null`，启动时仍会检查目录是否存在，即使生成病例数为 `0`。完全不需要原始图像时应将它设为 `null`。
 
 ```powershell
 # 离线 W&B，之后可用 wandb sync 上传该离线目录
@@ -123,15 +165,32 @@ uv run python scripts/train_ct2pet.py --resume outputs/ct2pet/ct_control_baselin
 
 ### 多卡训练（DDP）
 
-训练入口自动读取 `torchrun` 的 `RANK`、`LOCAL_RANK` 和 `WORLD_SIZE`，每张 GPU 对应一个进程；普通 `python scripts/train_ct2pet.py` 继续使用单卡。`dist_backend=auto` 在支持 NCCL 的 CUDA 环境使用 NCCL，其余环境使用 Gloo，可用 `--dist-backend` 显式选择。后端选择遵循 [PyTorch 2.10 分布式说明](https://docs.pytorch.org/docs/2.10/distributed.html)。
+训练入口自动读取 `torchrun` 的 `RANK`、`LOCAL_RANK` 和 `WORLD_SIZE`，每张 GPU 对应一个进程；普通 `uv run python scripts/train_ct2pet.py` 继续使用单卡。`dist_backend=auto` 在支持 NCCL 的 CUDA 环境使用 NCCL，其余环境使用 Gloo，可用 `--dist-backend` 显式选择。后端选择遵循 [PyTorch 2.10 分布式说明](https://docs.pytorch.org/docs/2.10/distributed.html)。
 
-在有四张 GPU 的 Linux/WSL 环境中，激活项目 Python 环境后启动：
+以下命令在 Linux/WSL 的项目根目录执行。先用 `nvidia-smi` 查看 GPU 编号，然后通过 `CUDA_VISIBLE_DEVICES` 指定要使用的卡。例如，只使用编号为 **1、3** 的两张 GPU，同时保证使用当前项目的 uv 环境：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4 scripts/train_ct2pet.py --device cuda --batch-size 2 --output-dir outputs/ct2pet/ct_control_ddp4 --run-name ct-control-ddp4
+nvidia-smi
+unset PYTHON_EXEC
+CUDA_VISIBLE_DEVICES=1,3 uv run python -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node=2 scripts/train_ct2pet.py \
+  --device cuda --batch-size 4 \
+  --output-dir outputs/ct2pet/ct_control_ddp2 --run-name ct-control-ddp2
 ```
 
-`batch_size` 是**每卡**上限；四卡各 2 例时，总 batch 上限为 8。保持原单卡总 batch=8 时，无需因卡数变化自动增大学习率。`max_steps` 仍按所有卡共同完成的 optimizer update 计数。多卡请使用 `--device cuda`，通过 `CUDA_VISIBLE_DEVICES` 选卡，不传 `cuda:1`。服务器上需先将配置中的 `E:/...` 数据路径改为服务器实际路径；没有原始参考图像可设 `reference_root=null`。
+进程内会把所选的 GPU 1、3 重新编号为逻辑 `cuda:0`、`cuda:1`，由 `LOCAL_RANK` 自动分配。`--nproc-per-node` 必须等于选择的卡数；`--device` 保持 `cuda`，不指定具体编号。`CUDA_VISIBLE_DEVICES` 和 `PYTHON_EXEC` 是启动进程的环境设置，不填写到训练 JSON 中。
+
+使用编号为 0、1、2、3 的四张 GPU：
+
+```bash
+unset PYTHON_EXEC
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node=4 scripts/train_ct2pet.py \
+  --device cuda --batch-size 2 \
+  --output-dir outputs/ct2pet/ct_control_ddp4 --run-name ct-control-ddp4
+```
+
+`batch_size` 是**每卡**上限；双卡各 4 例或四卡各 2 例时，总 batch 上限均为 8。保持原单卡总 batch=8 时，无需因卡数变化自动增大学习率。`max_steps` 仍按所有卡共同完成的 optimizer update 计数。服务器上需先将配置中的 `E:/...` 数据路径改为服务器实际路径；没有原始参考图像可设 `reference_root=null`。每个新实验使用独立的 `output_dir`。
 
 训练 sampler 在同形状的全局 batch 内分配各卡样本，保证每卡训练步数相同，保留不同裁剪尺寸。尾批有足够样本时不补齐，并按各卡样本数对 loss/梯度加权；尾批少于卡数时仅重复到每卡至少一例。因此少量尾批可能包含重复病例。验证和测试不补齐、不重复，允许某卡分片为空，最终按病例数汇总指标。`train/batch_size` 记录实际总 batch，配置另记录每卡 batch 上限及 world size。
 
@@ -140,7 +199,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --standalone --nnod
 checkpoint 保存全部 rank 的 Python、NumPy、Torch 和当前 CUDA 设备 RNG 状态，同时保留不含 `module.` 前缀的模型权重，可直接使用现有单卡推理入口。续跑要求保持原 world size、device 类型、通信后端、每卡 batch size 和优化设置；旧单卡 checkpoint 仍可单卡续跑，但不能直接切换为多卡续跑。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4 scripts/train_ct2pet.py --device cuda --batch-size 2 --output-dir outputs/ct2pet/ct_control_ddp4 --resume outputs/ct2pet/ct_control_ddp4/last.pt
+unset PYTHON_EXEC
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node=4 scripts/train_ct2pet.py \
+  --device cuda --batch-size 2 --output-dir outputs/ct2pet/ct_control_ddp4 \
+  --resume outputs/ct2pet/ct_control_ddp4/last.pt
 ```
 
 本机 Windows 的 PyTorch `2.10.0+cu128` 虽报告 Gloo 可用，但实际创建通信设备报 `unsupported gloo device`，且不提供 NCCL；这个构建无法运行 DDP。使用 Linux/WSL CUDA 环境运行正式多卡训练；启动入口会明确提示缺失的 Gloo transport，不会退化成多个独立训练进程。
