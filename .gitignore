@@ -15,6 +15,7 @@ checkpoints/manifest.json
 outputs/
 docs/
 .idea/
+tests/
 *.nii
 *.nii.gz
 

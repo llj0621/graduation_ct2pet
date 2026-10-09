@@ -1,0 +1,16 @@
+{
+  "input_root": "E:/graduation/latent_0820_LLJ",
+  "input_space": "raw",
+  "reference_root": "E:/graduation/data_0820",
+  "output_root": "outputs/ct2pet/predictions",
+  "checkpoint": "outputs/ct2pet/ct_control_baseline/best.pt",
+  "pet_checkpoint": "checkpoints/pet_vae_best.ckpt",
+  "latent_name": "ct.pt",
+  "device": "cuda",
+  "weights": "ema",
+  "seed": 42,
+  "decode": true,
+  "quantize": false,
+  "clip_output": true,
+  "overwrite": false
+}
