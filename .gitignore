@@ -14,3 +14,4 @@ checkpoints/*.ckpt
 outputs/
 *.nii
 *.nii.gz
+checkpoints/manifest.json
