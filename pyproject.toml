@@ -1,0 +1,39 @@
+[project]
+name = "ct2pet-cervical-cancer"
+version = "0.1.0"
+description = "CT/PET PVAE encoding and decoding for cervical cancer research"
+readme = "README.md"
+authors = [
+    { name = "llj0621", email = "2041587367@qq.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.10.0",
+    "numpy==2.4.1",
+    "einops==0.8.1",
+    "loguru==0.7.3",
+    "monai==1.5.2",
+    "nibabel==5.3.3",
+]
+
+[project.scripts]
+ct2pet-cervical-cancer = "ct2pet_cervical_cancer:main"
+ct2pet-encode = "ct2pet_cervical_cancer.pipelines.encode_latents:main"
+ct2pet-decode-pet = "ct2pet_cervical_cancer.pipelines.decode_pet:main"
+ct2pet-decode-ct = "ct2pet_cervical_cancer.pipelines.decode_ct:main"
+ct2pet-reconstruct = "ct2pet_cervical_cancer.pipelines.reconstruct_vae:main"
+ct2pet-crop = "ct2pet_cervical_cancer.pipelines.crop_ct_pet:main"
+
+[tool.uv]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[build-system]
+requires = ["uv_build>=0.12.24,<0.13.0"]
+build-backend = "uv_build"

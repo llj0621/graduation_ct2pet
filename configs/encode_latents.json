@@ -1,0 +1,10 @@
+{
+  "input_root": "E:/graduation/data_0820",
+  "output_root": "outputs/encoded_latents",
+  "ct_checkpoint": "checkpoints/ct_vae_best.ckpt",
+  "pet_checkpoint": "checkpoints/pet_vae_best.ckpt",
+  "device": "cuda",
+  "encode_stride": 40,
+  "gaussian_sigma": 0.3,
+  "overwrite": false
+}

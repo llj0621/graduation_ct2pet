@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local model weights and generated imaging artifacts
+checkpoints/*.ckpt
+outputs/
+*.nii
+*.nii.gz

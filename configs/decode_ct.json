@@ -1,0 +1,12 @@
+{
+  "input_root": "E:/graduation/latent_0820_LLJ",
+  "reference_root": "E:/graduation/data_0820",
+  "output_root": "outputs/ct_latent_reconstruction",
+  "checkpoint": "checkpoints/ct_vae_best.ckpt",
+  "latent_name": "ct.pt",
+  "device": "cuda",
+  "gaussian_sigma": 0.3,
+  "quantize": true,
+  "clip_output": true,
+  "overwrite": true
+}

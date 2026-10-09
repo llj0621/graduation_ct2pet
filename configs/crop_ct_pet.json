@@ -1,0 +1,11 @@
+{
+  "nii_root": "E:/graduation/data/nii/patient",
+  "seg_root": "E:/graduation/data/seg/patient",
+  "output_root": "outputs/cropped_scans",
+  "min_depth": 80,
+  "depth_multiple": 8,
+  "margin": 0,
+  "workers": 4,
+  "overwrite": false,
+  "fail_fast": false
+}

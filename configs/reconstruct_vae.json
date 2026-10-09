@@ -1,0 +1,9 @@
+{
+  "case_dir": "E:/graduation/data/nii/patient/101020084713",
+  "ct_checkpoint": "checkpoints/ct_vae_best.ckpt",
+  "pet_checkpoint": "checkpoints/pet_vae_best.ckpt",
+  "output_dir": "outputs/vae_reconstruction",
+  "device": "cuda",
+  "encode_stride": 40,
+  "gaussian_sigma": 0.3
+}
