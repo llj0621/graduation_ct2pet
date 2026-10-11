@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import random
 from dataclasses import asdict
 from pathlib import Path
@@ -13,9 +14,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from ..datasets.latent_transform import LatentTransform
 from ..datasets.paired_latents import (PairedLatentDataset, ShapeBatchSampler, DistributedShapeBatchSampler, checkpoint_transform,
-                                      discover_pairs, resolve_split, stable_seed)
+                                      discover_pairs, resolve_split, stable_seed, file_sha256)
 from ..inference.evaluate_ct2pet import evaluate_generated
 from ..models.diffusion import CTControlDiffusion, CTControlDiffusionConfig, NoiseScheduler
+from ..models.diffusion.losses import IMAGE_L1_DEFAULTS, ImageL1Loss
 from ..utils.cli import parse_config_args
 from ..utils.experiment import ExperimentLogger, save_checkpoint
 from ..utils.distributed import DistributedContext
@@ -52,6 +54,11 @@ def parse_args() -> argparse.Namespace:
                           ("validation-fraction", 0.1), ("test-fraction", 0.1)):
         parser.add_argument(f"--{name}", type=float, default=default)
     parser.add_argument("--decode-quantize", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--image-l1-weight", type=float, default=0.0,
+                        help="Weight of decoded PET patch L1; zero disables decoder loading and image loss.")
+    parser.add_argument("--image-l1-target", choices=("vae_reconstruction", "paired_nifti"), default="vae_reconstruction")
+    parser.add_argument("--image-l1-timestep-weighting", choices=("none", "linear"), default="linear")
+    parser.add_argument("--image-l1-patch-size", type=int, default=80, help="Decoded image patch edge length in voxels.")
     parser.add_argument("--wandb-project", default="ct2pet-cervical-cancer")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
@@ -78,6 +85,16 @@ def validate_args(args):
         raise ValueError("Invalid learning rate, weight decay, EMA decay or gradient clipping")
     if args.stop_after is not None and not 1 <= args.stop_after <= args.max_steps:
         raise ValueError("stop_after must be between one and max_steps")
+    if not math.isfinite(args.image_l1_weight) or args.image_l1_weight < 0:
+        raise ValueError("image_l1_weight must be finite and nonnegative")
+    if args.image_l1_patch_size < 1:
+        raise ValueError("image_l1_patch_size must be positive")
+    if args.image_l1_target not in {"vae_reconstruction", "paired_nifti"}:
+        raise ValueError("Unknown image_l1_target")
+    if args.image_l1_timestep_weighting not in {"none", "linear"}:
+        raise ValueError("Unknown image_l1_timestep_weighting")
+    if args.image_l1_weight > 0 and args.image_l1_target == "paired_nifti" and args.reference_root is None:
+        raise ValueError("paired_nifti image L1 requires reference_root")
     if args.resume is None and any((args.output_dir / name).exists() for name in ("config.json", "last.pt", "metrics.jsonl")):
         raise FileExistsError("Experiment already exists; choose another --output-dir or use --resume last.pt")
     if args.resume is not None and args.resume.resolve().parent != args.output_dir.resolve():
@@ -94,10 +111,12 @@ def make_loader(dataset, batch_size: int, workers: int, shuffle: bool, seed: int
 
 
 @torch.inference_mode()
-def validate(model, scheduler, loader, device, seed, context: DistributedContext | None = None) -> dict:
+def validate(model, scheduler, loader, device, seed, context: DistributedContext | None = None,
+             image_loss: ImageL1Loss | None = None, image_l1_weight: float = 0.0) -> dict:
     was_training = model.training
     model.eval()
     total_loss = total_mse = total_mae = count = 0
+    total_image_l1 = total_image_weighted = 0.0
     try:
         for batch in loader:
             ct, pet = batch["ct"].to(device), batch["pet"].to(device)
@@ -110,18 +129,28 @@ def validate(model, scheduler, loader, device, seed, context: DistributedContext
             noisy = scheduler.add_noise(pet, noise, timesteps)
             prediction = model(noisy, timesteps, ct)
             loss = scheduler.loss(prediction, scheduler.velocity(pet, noise, timesteps), timesteps)
-            difference = scheduler.predict_x0(noisy, prediction, timesteps) - pet
+            clean_prediction = scheduler.predict_x0(noisy, prediction, timesteps)
+            difference = clean_prediction - pet
             batch_size = len(pet)
             total_loss += float(loss) * batch_size
             total_mse += float(difference.square().flatten(1).mean(1).sum())
             total_mae += float(difference.abs().flatten(1).mean(1).sum())
+            if image_loss is not None:
+                image_metrics = image_loss(clean_prediction, pet, timesteps, scheduler.num_timesteps, batch["case"], seed)
+                total_image_l1 += float(image_metrics["image_l1"]) * batch_size
+                total_image_weighted += float(image_metrics["image_l1_weighted"]) * batch_size
             count += batch_size
         if context is not None:
             total_loss, total_mse, total_mae, count = context.sum([total_loss, total_mse, total_mae, count])
+            if image_loss is not None:
+                total_image_l1, total_image_weighted = context.sum([total_image_l1, total_image_weighted])
         if count == 0:
             raise ValueError("Validation/test split contains no samples")
         result = {"v_loss": total_loss / count, "x0_mse": total_mse / count,
                   "x0_mae": total_mae / count, "case_count": int(count)}
+        if image_loss is not None:
+            result.update(image_l1=total_image_l1 / count, image_l1_weighted=total_image_weighted / count,
+                          total_loss=(total_loss + image_l1_weight * total_image_weighted) / count)
         if not all(np.isfinite(value) for value in result.values()):
             raise ValueError("Validation produced non-finite metrics")
         return result
@@ -130,6 +159,10 @@ def validate(model, scheduler, loader, device, seed, context: DistributedContext
 
 
 def train(args) -> dict:
+    # Programmatic callers and old configuration files retain the baseline defaults.
+    for key, default in IMAGE_L1_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, default)
     context = DistributedContext.from_environment(args.device, getattr(args, "dist_backend", "auto"))
     try:
         return train_with_context(args, context)
@@ -143,6 +176,22 @@ def prepare_inputs(args):
     split = resolve_split(records, args.split_manifest, args.seed, args.validation_fraction,
                           args.test_fraction, args.patient_map)
     ct_transform, pet_transform = checkpoint_transform(args.ct_checkpoint), checkpoint_transform(args.pet_checkpoint)
+    if args.image_l1_weight > 0:
+        from ..models.vae.loading import load_config
+        from ..models.vae.pet import PETEncoderDecoderConfig
+        config = load_config(args.pet_checkpoint, PETEncoderDecoderConfig)
+        upscale = 8 if config.scale == "8X" else 4
+        if args.image_l1_patch_size % upscale:
+            raise ValueError("image_l1_patch_size must be a multiple of the PET decoder scale")
+        if args.image_l1_target == "paired_nifti":
+            import nibabel as nib
+            for row in split["records"]:
+                path = args.reference_root / row["case"] / "pet.nii.gz"
+                expected = tuple(size * upscale for size in row["shape"][1:])
+                if nib.load(str(path)).shape != expected:
+                    raise ValueError(f"PET reference grid differs for {row['case']}; expected {expected}")
+                # Include the image supervision data in the exact-resume contract.
+                row["image_l1_reference_sha256"] = file_sha256(path)
     return records, split, ct_transform.to_dict(), pet_transform.to_dict()
 
 
@@ -169,6 +218,10 @@ def train_with_context(args, context) -> dict:
     configuration = {"format": "ct2pet_ct_control_training_v1",
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "model_config": asdict(model_config), "schedule_config": schedule_config,
+        "loss_config": {"primary": "min_snr_velocity_mse", "image_l1_weight": args.image_l1_weight,
+            "image_l1_target": args.image_l1_target, "image_l1_timestep_weighting": args.image_l1_timestep_weighting,
+            "image_l1_patch_size": args.image_l1_patch_size, "decoder_frozen": True,
+            "decoder_quantize": False, "prediction_clipped": False, "image_coordinates": "decoder_normalized"},
         "ct_transform": ct_transform.to_dict(), "pet_transform": pet_transform.to_dict(),
         "data_identity": identity, "split_grouping": split.get("grouping", "explicit_manifest"),
         "split_counts": {name: len(dataset) for name, dataset in datasets.items()},
@@ -210,6 +263,14 @@ def train_with_context(args, context) -> dict:
         for key in ("input_space", "batch_size", "seed", "max_steps", "precision", "learning_rate", "weight_decay", "ema_decay", "grad_clip"):
             if old["arguments"][key] != configuration["arguments"][key]:
                 raise ValueError(f"Resume training setting differs: {key}")
+        if old["arguments"].get("image_l1_weight", 0.0) != args.image_l1_weight:
+            raise ValueError("Resume training setting differs: image_l1_weight; start a separate experiment")
+        if args.image_l1_weight > 0:
+            for key, default in IMAGE_L1_DEFAULTS.items():
+                if old["arguments"].get(key, default) != configuration["arguments"][key]:
+                    raise ValueError(f"Resume training setting differs: {key}")
+            if args.image_l1_target == "paired_nifti" and old["arguments"].get("reference_root") != str(args.reference_root):
+                raise ValueError("Resume image L1 reference_root differs")
     model = CTControlDiffusion(model_config).to(device)
     if checkpoint:
         model.load_state_dict(checkpoint["model"], strict=True)
@@ -219,6 +280,10 @@ def train_with_context(args, context) -> dict:
         broadcast_buffers=False) if context.enabled else model)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     scheduler = NoiseScheduler(**schedule_config).to(device)
+    image_loss = (ImageL1Loss.from_checkpoint(args.pet_checkpoint, pet_transform, device,
+        patch_size=args.image_l1_patch_size, target=args.image_l1_target,
+        timestep_weighting=args.image_l1_timestep_weighting, reference_root=args.reference_root)
+        if args.image_l1_weight > 0 else None)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     learning_schedule = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=args.max_steps, power=1)
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "float16")
@@ -296,7 +361,13 @@ def train_with_context(args, context) -> dict:
                 dtype = torch.float16 if args.precision == "float16" else torch.bfloat16
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=args.precision != "float32"):
                     prediction = training_model(noisy, timesteps, ct)
-                    loss = scheduler.loss(prediction, scheduler.velocity(pet, noise, timesteps), timesteps)
+                    v_loss = scheduler.loss(prediction, scheduler.velocity(pet, noise, timesteps), timesteps)
+                loss = v_loss
+                image_metrics = {}
+                if image_loss is not None:
+                    image_metrics = image_loss(scheduler.predict_x0(noisy, prediction, timesteps), pet,
+                                               timesteps, scheduler.num_timesteps, batch["case"])
+                    loss = v_loss + args.image_l1_weight * image_metrics["image_l1_weighted"]
                 global_batch, finite_ranks = context.sum([pet.shape[0], int(torch.isfinite(loss))])
                 if finite_ranks != context.world_size:
                     raise ValueError("Non-finite training loss")
@@ -314,15 +385,20 @@ def train_with_context(args, context) -> dict:
                 step += 1
                 batch_offset = index + 1
                 if step == 1 or step % args.log_interval == 0 or step == target_step:
-                    loss_sum, sample_count = context.sum([float(loss.detach()) * pet.shape[0], pet.shape[0]])
-                    average_loss = loss_sum / sample_count
-                    context.on_main(lambda: logger.log({"train/v_loss": average_loss,
+                    components = {"v_loss": v_loss, **image_metrics}
+                    if image_loss is not None:
+                        components["total_loss"] = loss
+                    values = context.sum([float(value.detach()) * pet.shape[0] for value in components.values()] + [pet.shape[0]])
+                    sample_count = values[-1]
+                    logged_losses = {f"train/{key}": value / sample_count for key, value in zip(components, values[:-1], strict=True)}
+                    context.on_main(lambda: logger.log({**logged_losses,
                         "train/learning_rate": optimizer.param_groups[0]["lr"], "train/grad_norm": float(grad_norm),
                         "train/batch_size": int(sample_count), "train/world_size": context.world_size}, step))
                     if context.is_main:
-                        print(f"step {step}/{args.max_steps}: v_loss={average_loss:.6f}")
+                        print(f"step {step}/{args.max_steps}: " + ", ".join(
+                              f"{key}={value:.6f}" for key, value in logged_losses.items()))
                 if step % args.validation_interval == 0 or step == target_step:
-                    metrics = validate(ema, scheduler, val_loader, device, args.seed, context)
+                    metrics = validate(ema, scheduler, val_loader, device, args.seed, context, image_loss, args.image_l1_weight)
                     context.on_main(lambda: logger.log({f"val/{key}": value for key, value in metrics.items()}, step))
                     if metrics["v_loss"] < best_loss:
                         best_loss = metrics["v_loss"]
@@ -347,7 +423,7 @@ def train_with_context(args, context) -> dict:
             ema.load_state_dict(best["ema"], strict=True)
             best_step = best["global_step"]
             del best
-            metrics = validate(ema, scheduler, test_loader, device, args.seed, context)
+            metrics = validate(ema, scheduler, test_loader, device, args.seed, context, image_loss, args.image_l1_weight)
             context.on_main(lambda: logger.log({f"test/{key}": value for key, value in metrics.items()} |
                        {"test/checkpoint_step": best_step}, step))
             if args.test_samples:

@@ -119,9 +119,61 @@ uv run python scripts/train_ct2pet.py
 
 W&B 和本地 `metrics.jsonl` 记录训练 v-loss、学习率、梯度范数、实际 batch size，固定 seed 验证 v-loss 与一步 x0 误差、最终 test loss。每个生成验证周期使用固定病例和 seed，从纯噪声采样；记录完整生成的 latent MAE/MSE。验证 loss 选择 EMA 最佳 checkpoint；最终测试使用最佳 EMA，而不是最后一步权重。
 
-配置 `reference_root` 时，还记录生成 PET 对实际配对 PET NIfTI 的 MAE、MSE、PSNR、轴位 SSIM，逐病例 W&B 表和三方向的真实/生成/误差图。参考 PET 仅用于评价，裁剪到 `[0,5]`；像素指标固定 data range=5，单位沿用源 PET 数据。参考尺寸必须与解码结果一致，不把 latent 的 VAE 重建当作真实 PET。生成像素指标仅覆盖配置中固定数量的病例，test diffusion loss 覆盖完整测试集；不能把这几个病例的生成指标视为全测试集的生成指标。
+配置 `reference_root` 时，还记录生成 PET 对实际配对 PET NIfTI 的 MAE、MSE、PSNR、轴位 SSIM，逐病例 W&B 表和三方向的真实/生成/误差图。默认参考 PET 仅用于评价；开启下文的 `paired_nifti` 图像 L1 时也用于监督。评价参考裁剪到 `[0,5]`；像素指标固定 data range=5，单位沿用源 PET 数据。参考尺寸必须与解码结果一致，不把 latent 的 VAE 重建当作真实 PET。生成像素指标仅覆盖配置中固定数量的病例，test diffusion loss 覆盖完整测试集；不能把这几个病例的生成指标视为全测试集的生成指标。
 
 默认 float32；CUDA 可以用 `--precision bfloat16` 或 `float16`。训练没有开始时配置错误会直接报出；数据合同、网络或优化器设置不匹配时拒绝续跑。
+
+#### 可选的图像域 L1
+
+保留原来的 Min-SNR 加权 v-MSE，新增解码图像的局部 L1：
+
+```text
+z0_hat = scheduler.predict_x0(z_t, v_hat, t)
+Y_hat = frozen_pet_decoder(pet_transform.inverse(z0_hat 的对应窗口))
+image_l1 = mean(abs(Y_hat - Y_target))
+total_loss = v_loss + image_l1_weight * mean(w(t) * 每病例 image_l1)
+```
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `image_l1_weight` | `0.0` | 总损失中图像 L1 的系数；`0` 关闭该项，不加载训练用 decoder，维持原训练路径。 |
+| `image_l1_target` | `"vae_reconstruction"` | 解码配对真实 `pet.pt` 的对应窗口作为目标。可选 `"paired_nifti"`，读取 `reference_root/<case>/pet.nii.gz` 的对应窗口作为目标。 |
+| `image_l1_timestep_weighting` | `"linear"` | `w(t)=(T-t)/T`，t 为从 0 开始的噪声时间步；高噪声时降低图像约束。`"none"` 使用恒定权重 1。 |
+| `image_l1_patch_size` | `80` | 解码图像窗口的边长，单位为图像体素，须为 PET VAE 缩放倍率 8 或 4 的正整数倍。 |
+
+每例每个训练 step 随机选择一个对应 latent 窗口，窗口小于配置尺寸时使用该维度的全部 latent。预测和目标使用相同位置；验证/测试按病例 seed 固定窗口与噪声，方便比较。该项是**单步干净 latent 估计的局部图像误差**，不是完整 DDPM 生成图像的误差，也不是全体积均匀采样的精确估计；窗口边缘与完整滑窗融合的解码结果可能不同。
+
+PET decoder 保持 eval、冻结参数，但预测端保留梯度；以 float32 解码，并通过 activation checkpointing 减少反传显存。预测不量化、不裁剪；`decode_quantize` 仅控制生成评价。优化器和 DDP 同步的仍是扩散网络参数，额外 decoder 在每卡各加载一份。开启 L1 会增加解码、反传的时间和显存开销。
+
+`vae_reconstruction` 目标是 `D(z0)`，**不是原始 PET**，无需 `reference_root`，也无需病灶 mask。`paired_nifti` 才直接监督实际 PET：目标裁剪到 `[0,5]` 后除以 2.5 再减 1，转换到 decoder 的强度坐标；不裁剪预测。此时必须提供参考目录，所有病例的参考尺寸须为 latent 空间尺寸乘以 VAE 缩放倍率。图像还须与 latent 的预处理、裁剪位置和轴顺序一致，代码不自动配准或重采样，尺寸检查不能证明空间配准正确。
+
+例如，在配置文件中加入或修改以下字段，并保留其他训练设置：
+
+```json
+{
+  "image_l1_weight": 0.01,
+  "image_l1_target": "vae_reconstruction",
+  "image_l1_timestep_weighting": "linear",
+  "image_l1_patch_size": 80,
+  "reference_root": null,
+  "validation_samples": 0,
+  "test_samples": 0,
+  "output_dir": "outputs/ct2pet/ct_control_image_l1",
+  "run_name": "ct-control-image-l1"
+}
+```
+
+`0.01` 是小权重消融的起点，不是已验证的最优值。也可用 CLI 覆盖配置：
+
+```powershell
+uv run python scripts/train_ct2pet.py --image-l1-weight 0.01 --output-dir outputs/ct2pet/ct_control_image_l1 --run-name ct-control-image-l1
+```
+
+多卡仍使用下文的 uv + DDP 入口，在命令尾部添加 `--image-l1-weight 0.01`、独立的 `--output-dir` 和 `--run-name`。使用实际 PET 作目标则添加 `--image-l1-target paired_nifti --reference-root <配对图像目录>`。
+
+W&B 和 `metrics.jsonl` 在启用后分别记录 `train/val/test` 的 `v_loss`、`image_l1`（未加时间权重）、`image_l1_weighted`（加时间权重，尚未乘总系数）及 `total_loss`。多卡按病例数汇总这些指标。`best.pt` 继续按验证 `v_loss` 选择，以保持与 baseline 相同的选择规则；图像 L1 和真实生成效果需另外比较。
+
+旧配置和旧 checkpoint 的缺失字段按默认值处理，关闭 L1 时仍可续跑。精确续跑要求 L1 系数、目标、窗口、时间权重一致，实际图像监督还要求参考目录及图像文件哈希一致；启用 `paired_nifti` 时启动检查会读取全部参考文件计算哈希。不能通过 `--resume` 把原来单一 L2 的实验改成复合损失。更换损失请创建独立实验，训练脚本不会自动把旧权重作为新实验的初始化。
 
 #### 参考图像与生成检查的三个配置
 
@@ -129,11 +181,11 @@ W&B 和本地 `metrics.jsonl` 记录训练 v-loss、学习率、梯度范数、�
 
 | 配置 | 含义 |
 | --- | --- |
-| `reference_root` | 原始配对 PET 图像的根目录，评价时读取 `<reference_root>/<case>/pet.nii.gz`。设置为 JSON 的 `null` 时不读取原始图像、不进行 VAE 图像解码和图像指标评价。 |
+| `reference_root` | 原始配对 PET 图像的根目录，评价时读取 `<reference_root>/<case>/pet.nii.gz`，也可供 `paired_nifti` 图像 L1 监督。设为 `null` 时不读取原始图像、不做真实 PET 图像指标评价；启用重建目标的 L1 时仍会解码训练窗口。 |
 | `validation_samples` | 每到 `sample_interval`，从验证集中选择固定数量的病例，从纯噪声完整采样 PET。设置为 `0` 时关闭这项生成检查。 |
 | `test_samples` | 正式训练完成后，使用最佳 EMA 为固定数量的测试病例完整采样 PET。设置为 `0` 时关闭这项生成检查。 |
 
-`reference_root` 不参与扩散训练 loss，也不是生成模型的输入条件。训练仍使用 `ct.pt/pet.pt`；`best.pt` 始终按验证集 `v_loss` 选择，不按 PET 图像指标选择。
+默认 `reference_root` 不参与扩散训练 loss；只有开启 `image_l1_weight>0` 且设置 `image_l1_target="paired_nifti"` 时，它才用于监督。它始终不是生成模型的输入条件。训练仍使用 `ct.pt/pet.pt`；`best.pt` 始终按验证集 `v_loss` 选择，不按 PET 图像指标选择。
 
 只把 `reference_root` 改为 `null`，保留非零 `validation_samples`、`test_samples` 时，仍会执行完整 DDPM 采样、保存生成的 `pet_pred.pt` 并记录生成 latent 的 MAE/MSE；只是没有 PET 图像 MAE/MSE、PSNR、SSIM 和真实/生成/误差对比图。提供图像目录时则额外加载固定的 PET VAE decoder，解码后与真实 PET 图像比较；参考图像尺寸必须与解码结果一致。生成指标仅覆盖选中的病例。
 
@@ -149,7 +201,7 @@ W&B 和本地 `metrics.jsonl` 记录训练 v-loss、学习率、梯度范数、�
 
 这是配置片段，请保留完整配置中的其他字段。使用 JSON 的 `null`，不要写成字符串 `"null"`。
 
-这组设置仍会记录训练 v-loss、验证/测试 diffusion loss、验证/测试的一步 x0 误差，正常保存 `best.pt`、`last.pt` 和定期 checkpoint，并支持断点续训；关闭的是从纯噪声开始的完整 PET 生成、生成 latent 指标和图像评价。原始图像不再是训练依赖，可以减少采样、VAE 解码及 W&B 图片记录的耗时。多卡训练中，生成评价由主进程执行，其他卡等待；关闭生成检查也会减少这段等待时间。
+这组设置仍会记录训练 v-loss、验证/测试 diffusion loss、验证/测试的一步 x0 误差，正常保存 `best.pt`、`last.pt` 和定期 checkpoint，并支持断点续训；关闭的是从纯噪声开始的完整 PET 生成、生成 latent 指标和图像评价。原始图像不再是训练依赖，可以减少采样、生成评价的 VAE 解码及 W&B 图片记录的耗时；若启用了重建目标的图像 L1，其训练和验证窗口仍会解码。多卡训练中，生成评价由主进程执行，其他卡等待；关闭生成检查也会减少这段等待时间。
 
 若 `reference_root` 非 `null`，启动时仍会检查目录是否存在，即使生成病例数为 `0`。完全不需要原始图像时应将它设为 `null`。
 
@@ -231,8 +283,12 @@ uv run python -m unittest discover -s tests -v
 
 测试覆盖 v-prediction 数学关系、CT 与 timestep 对输出的作用、两分支梯度、固定采样、数据分组隔离、变量尺寸分批、独立模态变换、严格输入检查、真实 PET 像素指标、训练恢复一致性，以及完全没有 PET 文件时的 CT-only 推理。
 
-`test_ct2pet_distributed.py` 额外检查同形状全局分批、尾批覆盖、验证样本不重复及空分片，并用两个真实 Gloo 进程验证模型副本同步、按样本数加权的梯度、全卡验证计数、主进程错误传播和中断续训一致性。缺少可用 Gloo transport 的 Windows 构建会明确跳过两个多进程测试。
+`test_ct2pet_image_loss.py` 检查 decoder 反归一化、时间权重、图像 L1 到扩散两分支的梯度、VAE 冻结、原始 PET 窗口位置与强度坐标、分项日志/W&B 调用，以及新旧损失配置的续训一致性和兼容性。
+
+`test_ct2pet_distributed.py` 额外检查同形状全局分批、尾批覆盖、验证样本不重复及空分片，并用两个真实 Gloo 进程验证模型副本同步、按样本数加权的梯度、全卡验证计数、主进程错误传播和中断续训一致性，包含开启图像 L1 的回归检查。缺少可用 Gloo transport 的 Windows 构建会明确跳过三个多进程测试。
 
 DDP 改造已在 Linux 容器中的 PyTorch `2.10.0+cpu` 通过全部 17 项测试，两个进程的模型副本相同，中断续训的 model/EMA 权重与连续训练逐元素相同。测试日志为 `outputs/ct2pet_ddp/linux_tests.log`。实际 `torchrun` 双进程四步检查也通过：仅创建一个 W&B 离线实验，日志不重复，checkpoint 保存两套 RNG 状态，多卡 checkpoint 可直接用于 CT-only 推理；记录见 `outputs/ct2pet_ddp/cli_verification.json` 和 `torchrun.log`。本机仅有一张 GPU，尚未实测多张 GPU 上的 NCCL 训练。
 
 2026-10-09 本机检查：13 项测试通过；1,245 对真实 latent 数据预检查通过；5 例真实数据的小网络两步训练完成了离线 W&B 指标、图片、逐病例表记录，以及真实 PET VAE 解码和 CT-only 推理。另检查了完整默认网络的 float32、batch size=8 单步训练，在 RTX 4090 上峰值 tensor 显存约 4.79 GiB。检查产物保存在 `outputs/ct2pet_preflight/` 和 `outputs/ct2pet_smoke/`，这些短时检查不代表正式模型的生成质量。
+
+2026-10-11 图像 L1 检查：26 项测试中 23 项通过，3 项多进程测试因本机 Gloo transport 不可用跳过。使用 5 例真实 latent 和真实 PET VAE，在 GPU 上完成小扩散网络的重建目标两步训练、原始 PET 目标一步训练，以及 bfloat16 输入的图像 L1 反传检查；训练、验证、测试分项指标均正常，VAE 参数保持冻结。W&B 新增字段通过 SDK 调用替身验证；本机受限环境的 W&B 离线服务未完成启动，因此本次 GPU 检查使用 `wandb_mode=disabled`，未验证实际 W&B 实验文件或在线上传。检查产物在 `outputs/ct2pet_image_l1_checks/`，不代表病灶质量已改善。
