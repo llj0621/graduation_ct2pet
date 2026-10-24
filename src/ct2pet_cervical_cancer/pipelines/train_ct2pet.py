@@ -13,6 +13,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from ..datasets.latent_transform import LatentTransform
+from ..datasets.lesion_sampling import LesionPatchSampler
 from ..datasets.paired_latents import (PairedLatentDataset, ShapeBatchSampler, DistributedShapeBatchSampler, checkpoint_transform,
                                       discover_pairs, resolve_split, stable_seed, file_sha256)
 from ..inference.evaluate_ct2pet import evaluate_generated
@@ -34,7 +35,7 @@ def write_json(path: Path, value: dict):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("input-root", "split-manifest", "patient-map", "ct-checkpoint", "pet-checkpoint",
-                 "output-dir", "reference-root", "resume"):
+                 "output-dir", "reference-root", "resume", "lesion-mask-root"):
         parser.add_argument(f"--{name}", type=Path, default=None)
     parser.add_argument("--input-space", choices=("raw", "codebook_minmax"), default="raw")
     parser.add_argument("--device", default="cuda")
@@ -59,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-l1-target", choices=("vae_reconstruction", "paired_nifti"), default="vae_reconstruction")
     parser.add_argument("--image-l1-timestep-weighting", choices=("none", "linear"), default="linear")
     parser.add_argument("--image-l1-patch-size", type=int, default=80, help="Decoded image patch edge length in voxels.")
+    parser.add_argument("--lesion-sampling-probability", type=float, default=0.0,
+                        help="Training-only probability of a lesion-containing image L1 patch; zero disables masks.")
     parser.add_argument("--wandb-project", default="ct2pet-cervical-cancer")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
@@ -95,6 +98,15 @@ def validate_args(args):
         raise ValueError("Unknown image_l1_timestep_weighting")
     if args.image_l1_weight > 0 and args.image_l1_target == "paired_nifti" and args.reference_root is None:
         raise ValueError("paired_nifti image L1 requires reference_root")
+    if not math.isfinite(args.lesion_sampling_probability) or not 0 <= args.lesion_sampling_probability <= 1:
+        raise ValueError("lesion_sampling_probability must be between zero and one")
+    if args.lesion_sampling_probability > 0:
+        if args.image_l1_weight <= 0:
+            raise ValueError("Lesion sampling requires image_l1_weight > 0")
+        if args.lesion_mask_root is None:
+            raise ValueError("Lesion sampling requires lesion_mask_root")
+        if not args.lesion_mask_root.is_dir():
+            raise FileNotFoundError(args.lesion_mask_root)
     if args.resume is None and any((args.output_dir / name).exists() for name in ("config.json", "last.pt", "metrics.jsonl")):
         raise FileExistsError("Experiment already exists; choose another --output-dir or use --resume last.pt")
     if args.resume is not None and args.resume.resolve().parent != args.output_dir.resolve():
@@ -192,6 +204,17 @@ def prepare_inputs(args):
                     raise ValueError(f"PET reference grid differs for {row['case']}; expected {expected}")
                 # Include the image supervision data in the exact-resume contract.
                 row["image_l1_reference_sha256"] = file_sha256(path)
+        if args.lesion_sampling_probability > 0:
+            for row in split["records"]:
+                if row["split"] != "train":
+                    continue
+                path = args.lesion_mask_root / f"{row['case']}.nii.gz"
+                expected = tuple(size * upscale for size in row["shape"][1:])
+                reference = (args.reference_root / row["case"] / "pet.nii.gz"
+                             if args.reference_root is not None else None)
+                mask = LesionPatchSampler.load_mask(path, expected, reference)
+                row["lesion_mask_sha256"] = file_sha256(path)
+                row["lesion_mask_voxels"] = int(np.count_nonzero(mask))
     return records, split, ct_transform.to_dict(), pet_transform.to_dict()
 
 
@@ -234,6 +257,16 @@ def train_with_context(args, context) -> dict:
             "global_batch_size_limit": args.batch_size * context.world_size,
             "training_tail_policy": "repeat_only_if_smaller_than_world_size",
             "evaluation_padding": False}}
+    if args.lesion_sampling_probability > 0:
+        training_rows = [row for row in split["records"] if row["split"] == "train"]
+        configuration["loss_config"]["lesion_sampling"] = {
+            "mask_root": str(args.lesion_mask_root), "probability": args.lesion_sampling_probability,
+            "mask_filename": "{case}.nii.gz", "training_only": True,
+            "selection": "occupied_latent_cell_then_random_containing_patch",
+            "empty_mask": "uniform_random_patch", "missing_mask": "error",
+            "reference_grid_checked": args.reference_root is not None,
+            "training_mask_count": len(training_rows),
+            "empty_training_masks": sum(row["lesion_mask_voxels"] == 0 for row in training_rows)}
     context.on_main(lambda: args.output_dir.mkdir(parents=True, exist_ok=True))
     if context.is_main:
         print(json.dumps({key: configuration[key] for key in
@@ -282,7 +315,8 @@ def train_with_context(args, context) -> dict:
     scheduler = NoiseScheduler(**schedule_config).to(device)
     image_loss = (ImageL1Loss.from_checkpoint(args.pet_checkpoint, pet_transform, device,
         patch_size=args.image_l1_patch_size, target=args.image_l1_target,
-        timestep_weighting=args.image_l1_timestep_weighting, reference_root=args.reference_root)
+        timestep_weighting=args.image_l1_timestep_weighting, reference_root=args.reference_root,
+        lesion_mask_root=args.lesion_mask_root, lesion_sampling_probability=args.lesion_sampling_probability)
         if args.image_l1_weight > 0 else None)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     learning_schedule = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=args.max_steps, power=1)

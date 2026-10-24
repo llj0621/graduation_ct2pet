@@ -175,6 +175,63 @@ W&B 和 `metrics.jsonl` 在启用后分别记录 `train/val/test` 的 `v_loss`�
 
 旧配置和旧 checkpoint 的缺失字段按默认值处理，关闭 L1 时仍可续跑。精确续跑要求 L1 系数、目标、窗口、时间权重一致，实际图像监督还要求参考目录及图像文件哈希一致；启用 `paired_nifti` 时启动检查会读取全部参考文件计算哈希。不能通过 `--resume` 把原来单一 L2 的实验改成复合损失。更换损失请创建独立实验，训练脚本不会自动把旧权重作为新实验的初始化。
 
+#### 病灶 mask 混合采样（图像 L1）
+
+通过 `lesion_mask_root` 指定独立的病灶 mask 目录。文件名与 latent 病例子目录对应：
+
+```text
+latent_0820_LLJ/101020072771/ct.pt
+latent_0820_LLJ/101020072771/pet.pt
+lesion_masks/101020072771.nii.gz
+```
+
+mask 为有限的 `0/1` 三维 NIfTI；当前数据尺寸为 `320×320×80`，应与编码 `pet.pt` 时使用的图像处于同一网格、裁剪位置及轴顺序。启动时检查尺寸等于 PET latent 空间尺寸乘以 decoder 倍率（8X 时是 `40×40×10` latent）。有 `reference_root` 时还会检查训练 mask 与对应 `pet.nii.gz` 的 affine 和尺寸；没有参考图像时只能检查尺寸，需自行确保空间一致。不会自动 resize 或重采样 mask。
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `lesion_mask_root` | `null` | mask 目录；按 `{case}.nii.gz` 查找，只要求训练集病例的 mask。 |
+| `lesion_sampling_probability` | `0.0` | 每例训练时选择病灶引导窗口的概率，取值 `[0,1]`；例如 `0.5` 表示病灶引导和普通随机窗口混合。`0` 保持原采样及随机数路径，不读取 mask。 |
+
+病灶分支先随机选取一个包含病灶体素的 latent 单元，再随机选择包含该单元的合法窗口，保证选中的图像块覆盖至少一个病灶体素，并保留周围组织。用块内“任一阳性体素”映射到 latent 单元，小病灶不会因缩小而丢失。普通分支仍随机选窗，也可能自然覆盖病灶。每例每步仍只解码一个图像块；`80³` 窗口在本数据的深度方向覆盖全部 80 层，主要在另外两个方向选位置。
+
+空 mask 表示已确认无病灶，回退到普通随机窗口；缺失训练 mask 则报错，避免将未标注病例默认为阴性。若只有部分病例有标注，应先准备相应训练子集和独立划分，不能把未标注病例补成空 mask。验证/测试仍沿用原来的固定随机窗口，不读取 mask，完整 DDPM 生成和推理也不需要 mask。
+
+该功能只修改图像 L1 的选块位置，网络仍接收完整 CT/PET latent，v-MSE 对完整 latent 计算；不增加病灶区域加权 L1，不修改网络结构。必须同时启用 `image_l1_weight > 0`，否则混合采样没有监督作用，启动会报错。
+
+在现有训练配置中修改以下字段（将示例 mask 路径换为实际目录）：
+
+```json
+{
+  "image_l1_weight": 0.01,
+  "lesion_mask_root": "E:/graduation/lesion_masks",
+  "lesion_sampling_probability": 0.5,
+  "output_dir": "outputs/ct2pet/ct_control_mixed",
+  "run_name": "ct-control-mixed"
+}
+```
+
+先检查数据和 mask，不加载训练 decoder、不开始训练：
+
+```powershell
+uv run python scripts/train_ct2pet.py --image-l1-weight 0.01 --lesion-mask-root E:/graduation/lesion_masks --lesion-sampling-probability 0.5 --output-dir outputs/ct2pet/ct_control_mixed --run-name ct-control-mixed --dry-run
+```
+
+移除 `--dry-run` 即开始训练。Linux 双卡示例，数据路径改为服务器实际路径：
+
+```bash
+unset PYTHON_EXEC
+CUDA_VISIBLE_DEVICES=0,1 uv run python -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node=2 scripts/train_ct2pet.py \
+  --input-root /data/latent_0820_LLJ --reference-root /data/reference_pet \
+  --batch-size 4 --image-l1-weight 0.01 \
+  --lesion-mask-root /data/lesion_masks --lesion-sampling-probability 0.5 \
+  --output-dir outputs/ct2pet/ct_control_mixed --run-name ct-control-mixed
+```
+
+W&B 和 JSONL 新增 `train/image_l1_lesion_sampled_fraction`（实际走病灶引导分支的病例比例，不是所有窗口的病灶命中率）和 `train/image_l1_empty_mask_fraction`。DDP 按实际样本数汇总；配置记录概率、训练 mask 数量及空 mask 数量。训练 mask 内容指纹写入数据合同；改变 mask、目录或概率后，需新建实验，不能作为原实验精确续跑。关闭该功能时旧 checkpoint 仍可按原配置续跑。
+
+`test_ct2pet_lesion_sampling.py` 检查小病灶及边缘覆盖、混合比例、空 mask 回退、关闭功能时逐元素一致的结果及 RNG、验证不读取 mask、梯度、W&B 配置/日志、mask 内容变化检测和精确续跑。2026-10-25 本机回归共 36 项，32 项通过，4 项多进程检查因 Windows Gloo transport 限制跳过；真实 PET latent 和真实 decoder 配合合成 `320×320×80` 边缘 mask 的 CUDA 反传检查通过。记录见 `outputs/lesion_sampling_regression.log` 和 `outputs/lesion_sampling_gpu_check/result.json`；尚未在真实人工病灶 mask 上启动正式训练。
+
 #### 参考图像与生成检查的三个配置
 
 在 `configs/train_ct2pet.json` 中设置这三个字段：

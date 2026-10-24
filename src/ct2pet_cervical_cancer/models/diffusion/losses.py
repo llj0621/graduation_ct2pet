@@ -6,12 +6,14 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 from ...datasets.latent_transform import LatentTransform
 from ...datasets.paired_latents import stable_seed
+from ...datasets.lesion_sampling import LesionPatchSampler
 from ..vae.loading import load_config
 from ..vae.pet import PETDecoder, PETEncoderDecoderConfig
 
 
 IMAGE_L1_DEFAULTS = {"image_l1_weight": 0.0, "image_l1_target": "vae_reconstruction",
-                     "image_l1_timestep_weighting": "linear", "image_l1_patch_size": 80}
+                     "image_l1_timestep_weighting": "linear", "image_l1_patch_size": 80,
+                     "lesion_mask_root": None, "lesion_sampling_probability": 0.0}
 
 
 class ImageL1Loss(nn.Module):
@@ -24,7 +26,8 @@ class ImageL1Loss(nn.Module):
     """
     def __init__(self, decoder: nn.Module, transform: LatentTransform, patch_size: int = 80,
                  target: str = "vae_reconstruction", timestep_weighting: str = "linear",
-                 reference_root: Path | None = None):
+                 reference_root: Path | None = None, lesion_mask_root: Path | None = None,
+                 lesion_sampling_probability: float = 0.0):
         super().__init__()
         self.decoder = decoder.eval().requires_grad_(False)
         self.transform = transform
@@ -40,6 +43,12 @@ class ImageL1Loss(nn.Module):
         self.patch_size = patch_size // self.upscale
         self.target, self.timestep_weighting = target, timestep_weighting
         self.reference_root = reference_root
+        if not np.isfinite(lesion_sampling_probability) or not 0 <= lesion_sampling_probability <= 1:
+            raise ValueError("lesion_sampling_probability must be between zero and one")
+        if lesion_sampling_probability > 0 and lesion_mask_root is None:
+            raise ValueError("Lesion sampling requires lesion_mask_root")
+        self.patch_sampler = (LesionPatchSampler(lesion_mask_root, lesion_sampling_probability, self.upscale)
+                              if lesion_sampling_probability > 0 else None)
 
     @classmethod
     def from_checkpoint(cls, path: Path, transform: LatentTransform, device: torch.device, **kwargs):
@@ -68,13 +77,22 @@ class ImageL1Loss(nn.Module):
             raise ValueError("Image L1 requires matching batched PET latents and case IDs")
         sizes = tuple(min(size, self.patch_size) for size in clean.shape[2:])
         errors = []
+        selected_count = empty_count = 0
+        # Validation/test keep their original fixed random patches and never read masks.
+        mixed_sampling = self.patch_sampler is not None and seed is None
         # Keep the affine inverse and decoder in float32, also under AMP.
         with torch.autocast(device_type=prediction.device.type, enabled=False):
             for index, case in enumerate(cases):
                 generator = (torch.Generator(device=prediction.device).manual_seed(
                     stable_seed(seed, f"image_l1:{case}")) if seed is not None else None)
-                starts = tuple(int(torch.randint(length - size + 1, (), device=prediction.device,
-                               generator=generator)) for length, size in zip(clean.shape[2:], sizes, strict=True))
+                if mixed_sampling:
+                    starts, selected, empty = self.patch_sampler.sample(
+                        case, tuple(clean.shape[2:]), sizes, prediction.device, generator)
+                    selected_count += selected
+                    empty_count += empty
+                else:
+                    starts = tuple(int(torch.randint(length - size + 1, (), device=prediction.device,
+                                   generator=generator)) for length, size in zip(clean.shape[2:], sizes, strict=True))
                 slices = (slice(index, index + 1), slice(None)) + tuple(
                     slice(start, start + size) for start, size in zip(starts, sizes, strict=True))
                 raw_prediction = self.transform.inverse(prediction[slices].float())
@@ -91,4 +109,8 @@ class ImageL1Loss(nn.Module):
             per_case = torch.stack(errors)
             weights = ((num_timesteps - timesteps.float()) / num_timesteps
                        if self.timestep_weighting == "linear" else torch.ones_like(timesteps, dtype=torch.float32))
-            return {"image_l1": per_case.mean(), "image_l1_weighted": (weights * per_case).mean()}
+            result = {"image_l1": per_case.mean(), "image_l1_weighted": (weights * per_case).mean()}
+            if mixed_sampling:
+                result.update(image_l1_lesion_sampled_fraction=per_case.new_tensor(selected_count / len(cases)),
+                              image_l1_empty_mask_fraction=per_case.new_tensor(empty_count / len(cases)))
+            return result
