@@ -332,6 +332,66 @@ uv run python scripts/infer_ct2pet.py --case 101020072771 --no-decode
 uv run python scripts/decode_pet.py --input-root outputs/ct2pet/predictions --latent-name pet_pred.pt --case 101020072771 --no-quantize
 ```
 
+### 独立病灶评价（完整测试集）
+
+入口为 `scripts/evaluate_lesions.py`，配置为 `configs/evaluate_lesions.json`，也可运行 `uv run ct2pet-evaluate-lesions`。先执行 `uv sync` 安装新增的 SciPy 依赖。脚本独立于训练运行，不改变训练 loss 或 checkpoint 选择，不自动上传 W&B。
+
+默认从训练保存的 `split.json` 中读取 **全部 test 病例**，只读取所选 split。文件对应关系如下：
+
+```text
+reference_root/<case>/pet.nii.gz          # 原始物理强度 PET
+mask_root/<case>.nii.gz                  # 人工核对的 0/1 病灶 mask
+prediction_root/<case>/pet_prediction.nii.gz
+```
+
+读取已有生成 PET，无需 GPU、latent 或模型权重：
+
+```bash
+uv run python scripts/evaluate_lesions.py \
+  --split-manifest /data/1011_exp/split.json \
+  --reference-root /data/reference_data --mask-root /data/masks_backup \
+  --prediction-root /data/predictions/mixed_120k \
+  --output-dir outputs/lesion_eval/mixed_120k
+```
+
+训练结束时默认只生成 16 个测试病例；直接指向这些结果不能当作完整测试集。脚本遇到缺失病例默认报错。只有明确添加 `--allow-missing` 才评价现有子集，报告会列出遗漏病例并标记 `complete_split=false`；比较两组时必须核对 `protocol.case_names` 一致。
+
+若还没有完整测试集的生成 PET，可指定 checkpoint，脚本会先对测试集逐例仅从 CT 生成，再评价。模型和 VAE decoder 只加载一次；默认单卡，生成设置沿用 checkpoint 中的调度、latent 变换和量化设置，输出不裁剪：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/evaluate_lesions.py \
+  --split-manifest /data/1011_exp/split.json \
+  --reference-root /data/reference_data --mask-root /data/masks_backup \
+  --checkpoint /data/mixed_run/step_000120000.pt \
+  --input-root /data/latent_data --pet-checkpoint checkpoints/pet_vae_best.ckpt \
+  --prediction-root outputs/lesion_eval/mixed_120k/predictions \
+  --output-dir outputs/lesion_eval/mixed_120k/metrics --device cuda
+```
+
+生成需要同网格的 `reference_root/<case>/ct.nii.gz` 用于空间信息；参考 PET 和人工 mask 不进入采样。每例保存 `lesion_generation_metadata.json`，记录 checkpoint/CT/预测文件 SHA256、checkpoint 步数、seed、权重和解码设置。中断后使用同一命令可复用匹配的预测；改变 checkpoint、seed 或 CT 后会拒绝混用。覆盖已有生成结果需显式 `--regenerate`；覆盖统计报告用 `--overwrite`，两者独立。比较随机与混合采样时，换成相同步数的另一组 checkpoint，并使用不同的 prediction/output 目录。
+
+评价输出：
+
+| 文件 | 内容 |
+| --- | --- |
+| `per_case.csv` | 每病例病灶 MAE/MSE/RMSE、偏差、均值/峰值、整体 MAE/MSE、病灶/热点计数、强度超界比例和文件指纹。 |
+| `per_lesion.csv` | 每个真实病灶连通域的体积、强度误差、世界坐标质心、匹配热点 IoU 与匹配后的质心距离。 |
+| `per_hotspot.csv` | 预测高摄取连通域的体积、强度、位置及匹配标记，可用于人工核查未匹配热点。 |
+| `summary.json` | 汇总指标、完整性、实际病例列表、评价协议和缺失病例。 |
+| `results.json` | 包含逐病例、逐病灶、逐热点和汇总的完整数值结果。 |
+
+主指标建议先看 `case_macro_lesion_mae`、`case_macro_lesion_bias`、`voxel_micro_lesion_mae`、`lesion_macro_centroid_distance_mm` 和病灶/热点匹配计数。病例宏平均对每个阳性病例等权，体素微平均按病灶体素数加权，病灶宏平均对每个真实连通域等权。空 mask 病例不参与病灶误差平均，但参与热点统计；无定义的比例和误差记录为 `null`，不填零。质心距离只统计已匹配病灶，需与漏灶数同时看。
+
+强度误差默认对参考 PET 截断到 `[0,5]`，预测保持文件中的物理强度，以衔接现有生成指标；`raw_*` 字段另对未截断的参考 PET 计算误差/强度统计，并记录病灶中参考值超过 5 的比例。也可在 JSON 中设 `reference_clip_max=null` 关闭上界截断。旧 VAE 在编码前已截断到 5，不能用新评价恢复已丢失的高 SUV 信息。输入必须是物理强度 NIfTI，不能传入 `[-1,1]` 的 decoder 数据。已被上游截断的预测也无法由脚本还原。
+
+热点是 **预测 PET > `hotspot_threshold`** 的连通域，默认阈值 `2.5`；真实病灶直接取人工 mask，不再以 SUV 阈值裁剪。默认 26 邻接（`connectivity=3`），一对一匹配采用 IoU≥`match_iou`（默认 `0.1`），先最大化有效匹配数量、再最大化 IoU；一个大热点不能重复算作检出多个病灶。`min_hotspot_volume_mm3` 默认 `0`（不过滤），可显式指定固定的最小热点体积。
+
+**这些热点阈值/匹配规则是探索性评价协议，不是已验证的临床判定标准。** 未匹配热点可能包含膀胱等生理摄取，不等价于肿瘤假阳性；`hotspot_lesion_precision`、`hotspot_mask_dice` 等也不等价于语义分割性能。可用 `--evaluation-mask-root` 提供同样按 `{case}.nii.gz` 命名的有效评价区（1=保留），统一排除预先定义的生理区域；它只限制热点搜索，不改变病灶强度误差或整体误差。有效区必须保留所有人工病灶体素。阈值、IoU 和排除规则应在验证集确定后固定，再用于测试，不能按每组测试结果单独调整。默认截断协议要求热点阈值小于 5，避免将训练已截断的数据直接用于 `SUV>5` 检出。
+
+预测、参考 PET、病灶 mask 及有效评价区均检查三维尺寸和 affine，不自动配准/重采样。空间单位应为 mm；NIfTI 未声明单位时按 mm 解释并在逐病例结果中记录 `spatial_units=unknown`。本脚本不计算“mask 内 SSIM”，避免把清零背景后的 SSIM 误作病灶结构分数。
+
+2026-10-26 检查：评价新增 12 项测试通过，覆盖强度截断/原始口径、精确匹配/位移/漏灶/额外热点、微平均与宏平均、空 mask、网格检查、完整测试集要求、预测来源缓存校验和输入保护。整体 48 项测试中 44 项通过，4 项多进程测试因本机 Windows Gloo transport 限制跳过。另使用一例真实 `320×320×80` 人工 mask 和旧小网络生成 PET 跑通命令行与全部报表，记录于 `outputs/lesion_evaluation_smoke/`；其中 split 为单例读写检查夹具，不是研究正式测试划分，指标不能用于评价正式模型。
+
 ### 验证代码
 
 ```powershell

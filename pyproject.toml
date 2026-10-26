@@ -16,6 +16,7 @@ dependencies = [
     "nibabel==5.3.3",
     "wandb>=0.24.0,<1.0",
     "pillow>=11.0,<13.0",
+    "scipy>=1.14,<2.0",
 ]
 
 [project.scripts]
@@ -27,6 +28,7 @@ ct2pet-reconstruct = "ct2pet_cervical_cancer.pipelines.reconstruct_vae:main"
 ct2pet-crop = "ct2pet_cervical_cancer.pipelines.crop_ct_pet:main"
 ct2pet-train = "ct2pet_cervical_cancer.pipelines.train_ct2pet:main"
 ct2pet-infer = "ct2pet_cervical_cancer.pipelines.infer_ct2pet:main"
+ct2pet-evaluate-lesions = "ct2pet_cervical_cancer.pipelines.evaluate_lesions:main"
 
 [tool.uv]
 
