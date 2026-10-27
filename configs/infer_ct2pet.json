@@ -1,9 +1,9 @@
 {
-  "input_root": "E:/graduation/latent_0820_LLJ",
+  "input_root": "/home/data/LJ_Grad/latent_data",
   "input_space": "raw",
-  "reference_root": "E:/graduation/data_0820",
-  "output_root": "outputs/ct2pet/predictions",
-  "checkpoint": "outputs/ct2pet/ct_control_baseline/best.pt",
+  "reference_root": "/home/data/LJ_Grad/reference_data",
+  "output_root": "/home/data/LJ_Grad/1010/test_inference",
+  "checkpoint": "/home/data/LJ_Grad/1010/ct_control_baseline/last.pt",
   "pet_checkpoint": "checkpoints/pet_vae_best.ckpt",
   "latent_name": "ct.pt",
   "device": "cuda",
