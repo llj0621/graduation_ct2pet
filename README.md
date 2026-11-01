@@ -119,7 +119,7 @@ uv run python scripts/train_ct2pet.py
 
 W&B 和本地 `metrics.jsonl` 记录训练 v-loss、学习率、梯度范数、实际 batch size，固定 seed 验证 v-loss 与一步 x0 误差、最终 test loss。每个生成验证周期使用固定病例和 seed，从纯噪声采样；记录完整生成的 latent MAE/MSE。验证 loss 选择 EMA 最佳 checkpoint；最终测试使用最佳 EMA，而不是最后一步权重。
 
-配置 `reference_root` 时，还记录生成 PET 对实际配对 PET NIfTI 的 MAE、MSE、PSNR、轴位 SSIM，逐病例 W&B 表和三方向的真实/生成/误差图。默认参考 PET 仅用于评价；开启下文的 `paired_nifti` 图像 L1 时也用于监督。评价参考裁剪到 `[0,5]`；像素指标固定 data range=5，单位沿用源 PET 数据。参考尺寸必须与解码结果一致，不把 latent 的 VAE 重建当作真实 PET。生成像素指标仅覆盖配置中固定数量的病例，test diffusion loss 覆盖完整测试集；不能把这几个病例的生成指标视为全测试集的生成指标。
+配置 `reference_root` 时，还记录生成 PET 对实际配对 PET NIfTI 的 MAE、MSE、PSNR、轴位 SSIM，逐病例 W&B 表和三方向的真实/生成/误差图。默认参考 PET 仅用于评价；开启下文的 `paired_nifti` 图像 L1 或独立病灶 L1 时也用于监督。评价参考裁剪到 `[0,5]`；像素指标固定 data range=5，单位沿用源 PET 数据。参考尺寸必须与解码结果一致，不把 latent 的 VAE 重建当作真实 PET。生成像素指标仅覆盖配置中固定数量的病例，test diffusion loss 覆盖完整测试集；不能把这几个病例的生成指标视为全测试集的生成指标。
 
 默认 float32；CUDA 可以用 `--precision bfloat16` 或 `float16`。训练没有开始时配置错误会直接报出；数据合同、网络或优化器设置不匹配时拒绝续跑。
 
@@ -136,7 +136,7 @@ total_loss = v_loss + image_l1_weight * mean(w(t) * 每病例 image_l1)
 
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
-| `image_l1_weight` | `0.0` | 总损失中图像 L1 的系数；`0` 关闭该项，不加载训练用 decoder，维持原训练路径。 |
+| `image_l1_weight` | `0.0` | 总损失中全局图像块 L1 的系数；`0` 关闭该项。它和 `lesion_l1_weight` 均为 `0` 时不加载训练用 decoder。 |
 | `image_l1_target` | `"vae_reconstruction"` | 解码配对真实 `pet.pt` 的对应窗口作为目标。可选 `"paired_nifti"`，读取 `reference_root/<case>/pet.nii.gz` 的对应窗口作为目标。 |
 | `image_l1_timestep_weighting` | `"linear"` | `w(t)=(T-t)/T`，t 为从 0 开始的噪声时间步；高噪声时降低图像约束。`"none"` 使用恒定权重 1。 |
 | `image_l1_patch_size` | `80` | 解码图像窗口的边长，单位为图像体素，须为 PET VAE 缩放倍率 8 或 4 的正整数倍。 |
@@ -232,21 +232,84 @@ W&B 和 JSONL 新增 `train/image_l1_lesion_sampled_fraction`（实际走病灶�
 
 `test_ct2pet_lesion_sampling.py` 检查小病灶及边缘覆盖、混合比例、空 mask 回退、关闭功能时逐元素一致的结果及 RNG、验证不读取 mask、梯度、W&B 配置/日志、mask 内容变化检测和精确续跑。2026-10-25 本机回归共 36 项，32 项通过，4 项多进程检查因 Windows Gloo transport 限制跳过；真实 PET latent 和真实 decoder 配合合成 `320×320×80` 边缘 mask 的 CUDA 反传检查通过。记录见 `outputs/lesion_sampling_regression.log` 和 `outputs/lesion_sampling_gpu_check/result.json`；尚未在真实人工病灶 mask 上启动正式训练。
 
+#### 独立病灶 L1
+
+入口仍为 `scripts/train_ct2pet.py`。新配置 `configs/train_ct2pet_lesion_l1.json` 使用全局 L1 权重 `0.01`、病灶 L1 权重 `0.003`，旧的 `configs/train_ct2pet.json` 默认关闭病灶 L1。`0.003` 是初始实验值，需用验证集比较。
+
+```text
+每病例：普通随机图像块 -> 全局 L1（目标沿用 image_l1_target）
+有病灶病例：另外选一个病灶图像块 -> 只在该块的 mask 内计算 L1
+lesion_l1_per_case = sum(mask * abs(Y_hat - Y_pet)) / sum(mask)
+total_loss = v_loss
+           + image_l1_weight * mean_all_cases(w_image(t) * image_l1_per_case)
+           + lesion_l1_weight * mean_positive_cases(w_lesion(t) * lesion_l1_per_case)
+```
+
+病灶项固定使用真实 `reference_root/<case>/pet.nii.gz`，裁剪到 `[0,5]`，转换为 `SUV/2.5-1`，不使用 VAE 重建作目标。预测不裁剪、不量化。全局和病灶项共享同一份冻结 PET decoder，窗口分别选择；病灶 mask 不作为网络输入，完整 latent 上的 v-L2 和 CT-only 推理保持原路径。启用两项时，每个阳性病例每步需解码两个预测窗口，会增加时间和显存开销。
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `lesion_l1_weight` | `0.0` | 独立病灶 L1 系数；`0` 完全关闭该项。允许单独启用以做损失消融。 |
+| `lesion_l1_patch_size` | `80` | 独立病灶窗口边长，单位为图像体素，须为 VAE 倍率的正整数倍。 |
+| `lesion_l1_timestep_weighting` | `"linear"` | 默认 `(T-t)/T`，也支持 `"none"`。与全局项可独立配置。 |
+| `lesion_mask_root` | `null` | `{case}.nii.gz` 的二值 mask 目录；启用独立病灶 L1 后必须提供训练、验证和测试集全部病例的 mask。 |
+| `reference_root` | 同现有配置 | 必须提供各划分的真实 PET，并与 mask、latent 的原始图像网格一致。 |
+
+每次先等概率选择一个 26 邻域连通病灶，再选择其中的体素，最后随机选取包含该体素、与 latent 对齐的窗口。块内所有标注病灶体素均参与 ROI L1。小病灶不会因下采样消失，大病灶通过多步覆盖，不 resize；`80³` 在当前 `320×320×80` 图像上覆盖全部深度。
+
+已确认无病灶的空 mask 跳过 ROI 项，仍参与 v-L2 和全局 L1；缺失 mask 不按阴性处理，而是启动报错。至少需要一个阳性训练病例。启动检查全部 mask 的尺寸、二值标签和 PET affine，并将 mask/PET 哈希写入续训合同；不自动配准或重采样。验证/测试的独立病灶窗口按病例 seed 固定，不消耗训练 RNG。全局 L1 的验证/测试窗口仍维持原有固定随机窗口。
+
+主实验设置 `lesion_sampling_probability=0`，保留普通随机块全局 L1，由独立病灶块保证 ROI 监督。旧混合采样仍可使用；若同时开启，它只影响全局 L1 的训练选块，独立病灶项仍另取窗口。
+
+Linux 双卡示例，沿用此前服务器目录。mask 根目录须含三个划分的全部文件：
+
+```bash
+unset PYTHON_EXEC
+CUDA_VISIBLE_DEVICES=0,1 uv run python -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node=2 scripts/train_ct2pet.py \
+  --config configs/train_ct2pet_lesion_l1.json \
+  --input-root /home/data/LJ_Grad/latent_data \
+  --split-manifest /home/data/LJ_Grad/1011_exp/split.json \
+  --reference-root /home/data/LJ_Grad/reference_data \
+  --lesion-mask-root /home/data/LJ_Grad/masks_backup \
+  --image-l1-weight 0.01 --lesion-l1-weight 0.003 \
+  --lesion-sampling-probability 0 --batch-size 4 --device cuda \
+  --output-dir /home/data/LJ_Grad/independent_lesion_l1/roi_0003 \
+  --run-name ct-control-independent-lesion-l1-0003
+```
+
+`uv run python -m torch.distributed.run` 使用本项目 uv 环境；`CUDA_VISIBLE_DEVICES` 选择物理 GPU，`batch_size=4` 为每卡 4 例，总 batch 上限 8。首次可在同一命令末尾追加 `--dry-run` 检查合同；追加 `--stop-after 100000` 可先训练到 100k，保持 `max_steps=300000` 的学习率计划。检查点续训仍需原配置和原目录，不能用 `--resume` 给既有实验更换损失。
+
+W&B 和 `metrics.jsonl` 的 `train/val/test` 分别新增：
+
+- `lesion_l1`：先在每个窗口的 mask 内平均，再按阳性病例平均，未加时间权重。
+- `lesion_l1_weighted`：加时间权重，尚未乘 `lesion_l1_weight`。
+- `lesion_l1_contribution`：乘损失系数后的实际贡献。
+- `lesion_l1_case_count`、`lesion_l1_valid_fraction`：本次统计的有效病灶病例数及比例。
+- `lesion_l1_voxel_count`：参与计算的窗口内病灶体素总数。
+- `total_loss`：包含上述两个 L1 项的总损失。
+
+训练日志统计当前 step；验证/测试统计整个对应划分。DDP 的 ROI 梯度和指标均使用全局阳性病例数归一化，各卡阳性病例数不均、某卡全阴性、评价分片为空时也适用。全局无阳性时 ROI 值记为 `0`，同时有效病例数为 `0`，不能视为完美重建。
+
+这些是一步去噪估计、局部窗口的损失，不是完整生成的病灶评价。`best.pt` 仍按验证 `v_loss` 选择；完整 DDPM 的病灶结果使用下文独立评价脚本比较。该损失沿用 `[0,5]` 目标，不恢复被裁剪掉的高 SUV 差异。
+
+2026-11-01 本机回归共 60 项，55 项通过，5 项真实多进程测试因 Windows Gloo transport 限制跳过；另以真实 PET/CT latent、人工病灶 mask 和真实冻结 PET decoder，在 RTX 4090 上完成 `80³` 双损失 CUDA 反传检查，两个编码分支均收到非零梯度。该检查使用小型随机初始化扩散网络，不代表正式训练效果或正式网络显存需求。记录见 `outputs/lesion_l1_regression.log` 和 `outputs/lesion_l1_gpu_check/result.json`。
+
 #### 参考图像与生成检查的三个配置
 
 在 `configs/train_ct2pet.json` 中设置这三个字段：
 
 | 配置 | 含义 |
 | --- | --- |
-| `reference_root` | 原始配对 PET 图像的根目录，评价时读取 `<reference_root>/<case>/pet.nii.gz`，也可供 `paired_nifti` 图像 L1 监督。设为 `null` 时不读取原始图像、不做真实 PET 图像指标评价；启用重建目标的 L1 时仍会解码训练窗口。 |
+| `reference_root` | 原始配对 PET 图像的根目录，评价时读取 `<reference_root>/<case>/pet.nii.gz`，也供 `paired_nifti` 图像 L1 或独立病灶 L1 监督。未启用这些监督时可设为 `null`，此时不做真实 PET 图像指标评价；重建目标的全局 L1 仍会解码训练窗口。 |
 | `validation_samples` | 每到 `sample_interval`，从验证集中选择固定数量的病例，从纯噪声完整采样 PET。设置为 `0` 时关闭这项生成检查。 |
 | `test_samples` | 正式训练完成后，使用最佳 EMA 为固定数量的测试病例完整采样 PET。设置为 `0` 时关闭这项生成检查。 |
 
-默认 `reference_root` 不参与扩散训练 loss；只有开启 `image_l1_weight>0` 且设置 `image_l1_target="paired_nifti"` 时，它才用于监督。它始终不是生成模型的输入条件。训练仍使用 `ct.pt/pet.pt`；`best.pt` 始终按验证集 `v_loss` 选择，不按 PET 图像指标选择。
+默认 `reference_root` 不参与扩散训练 loss；开启 `image_l1_weight>0` 且设置 `image_l1_target="paired_nifti"`，或开启 `lesion_l1_weight>0` 时，它才用于监督。它始终不是生成模型的输入条件。训练仍使用 `ct.pt/pet.pt`；`best.pt` 始终按验证集 `v_loss` 选择，不按 PET 图像指标选择。
 
 只把 `reference_root` 改为 `null`，保留非零 `validation_samples`、`test_samples` 时，仍会执行完整 DDPM 采样、保存生成的 `pet_pred.pt` 并记录生成 latent 的 MAE/MSE；只是没有 PET 图像 MAE/MSE、PSNR、SSIM 和真实/生成/误差对比图。提供图像目录时则额外加载固定的 PET VAE decoder，解码后与真实 PET 图像比较；参考图像尺寸必须与解码结果一致。生成指标仅覆盖选中的病例。
 
-如果只需要训练及验证/测试 loss，希望关闭完整生成检查，将对应三个字段改为：
+如果只需要训练及验证/测试 loss，希望关闭完整生成检查，且未启用真实 PET 的全局或病灶 L1 监督，将对应三个字段改为：
 
 ```json
 {
@@ -260,7 +323,7 @@ W&B 和 JSONL 新增 `train/image_l1_lesion_sampled_fraction`（实际走病灶�
 
 这组设置仍会记录训练 v-loss、验证/测试 diffusion loss、验证/测试的一步 x0 误差，正常保存 `best.pt`、`last.pt` 和定期 checkpoint，并支持断点续训；关闭的是从纯噪声开始的完整 PET 生成、生成 latent 指标和图像评价。原始图像不再是训练依赖，可以减少采样、生成评价的 VAE 解码及 W&B 图片记录的耗时；若启用了重建目标的图像 L1，其训练和验证窗口仍会解码。多卡训练中，生成评价由主进程执行，其他卡等待；关闭生成检查也会减少这段等待时间。
 
-若 `reference_root` 非 `null`，启动时仍会检查目录是否存在，即使生成病例数为 `0`。完全不需要原始图像时应将它设为 `null`。
+若启用独立病灶 L1 或 `paired_nifti` 全局 L1，仍可把 `validation_samples` 和 `test_samples` 设为 `0` 关闭完整生成，但必须保留 `reference_root`。若 `reference_root` 非 `null`，启动时仍会检查目录是否存在，即使生成病例数为 `0`。完全不需要原始图像时应将它设为 `null`。
 
 ```powershell
 # 离线 W&B，之后可用 wandb sync 上传该离线目录

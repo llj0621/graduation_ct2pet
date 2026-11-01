@@ -63,3 +63,51 @@ class LesionPatchSampler:
         starts = tuple(int(torch.randint(low, high + 1, (), device=device, generator=generator))
                        for low, high in bounds)
         return starts, selected, not bool(len(coordinates))
+
+
+class LesionROIPatchSampler:
+    """Choose a component uniformly, then a scale-aligned patch containing it.
+
+    Cache sparse image coordinates rather than full 320x320x80 masks. The
+    returned mask includes every annotated lesion voxel inside the selected
+    patch, including components other than the one used to choose its location.
+    """
+    def __init__(self, mask_root: Path, upscale: int):
+        self.mask_root, self.upscale = Path(mask_root), upscale
+        self._components: dict[str, tuple[tuple, tuple[np.ndarray, ...]]] = {}
+
+    def components(self, case: str, spatial_shape: tuple) -> tuple[np.ndarray, ...]:
+        if case not in self._components:
+            from scipy import ndimage
+            expected = tuple(length * self.upscale for length in spatial_shape)
+            mask = LesionPatchSampler.load_mask(self.mask_root / f"{case}.nii.gz", expected)
+            labels, count = ndimage.label(mask, ndimage.generate_binary_structure(3, 3))
+            coordinates = np.argwhere(mask).astype(np.int32)
+            ids = labels[tuple(coordinates.T)]
+            components = tuple(coordinates[ids == index] for index in range(1, count + 1))
+            self._components[case] = (spatial_shape, components)
+        shape, components = self._components[case]
+        if shape != spatial_shape:
+            raise ValueError(f"Latent shape changed for ROI sampling: {case}")
+        return components
+
+    def sample(self, case: str, spatial_shape: tuple, sizes: tuple,
+               device: torch.device, generator: torch.Generator | None = None) -> tuple | None:
+        components = self.components(case, spatial_shape)
+        if not components:
+            return None
+        component = components[int(torch.randint(len(components), (), device=device, generator=generator))]
+        point = component[int(torch.randint(len(component), (), device=device, generator=generator))]
+        anchor = point // self.upscale
+        bounds = [(max(0, int(p) - size + 1), min(int(p), length - size))
+                  for p, length, size in zip(anchor, spatial_shape, sizes, strict=True)]
+        starts = tuple(int(torch.randint(low, high + 1, (), device=device, generator=generator))
+                       for low, high in bounds)
+        origin = np.asarray(starts) * self.upscale
+        image_sizes = np.asarray(sizes) * self.upscale
+        mask = np.zeros(tuple(image_sizes), dtype=np.uint8)
+        for coordinates in components:
+            local = coordinates - origin
+            inside = np.all((local >= 0) & (local < image_sizes), axis=1)
+            mask[tuple(local[inside].T)] = 1
+        return starts, mask
