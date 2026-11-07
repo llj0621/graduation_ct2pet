@@ -437,15 +437,33 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/evaluate_lesions.py \
 
 | 文件 | 内容 |
 | --- | --- |
-| `per_case.csv` | 每病例病灶 MAE/MSE/RMSE、偏差、均值/峰值、整体 MAE/MSE、病灶/热点计数、强度超界比例和文件指纹。 |
-| `per_lesion.csv` | 每个真实病灶连通域的体积、强度误差、世界坐标质心、匹配热点 IoU 与匹配后的质心距离。 |
+| `per_case.csv` | 每病例全图 MAE/MSE/PSNR/轴位 SSIM、人工 mask 内 SUVmean/SUVmax 及误差、病灶体素误差、热点计数、强度超界比例和文件指纹。 |
+| `per_lesion.csv` | 每个真实病灶连通域的 SUVmean/SUVmax、绝对/相对误差与有符号偏差，以及体积、世界坐标质心、匹配热点 IoU 与匹配后的质心距离。 |
 | `per_hotspot.csv` | 预测高摄取连通域的体积、强度、位置及匹配标记，可用于人工核查未匹配热点。 |
 | `summary.json` | 汇总指标、完整性、实际病例列表、评价协议和缺失病例。 |
 | `results.json` | 包含逐病例、逐病灶、逐热点和汇总的完整数值结果。 |
 
-主指标建议先看 `case_macro_lesion_mae`、`case_macro_lesion_bias`、`voxel_micro_lesion_mae`、`lesion_macro_centroid_distance_mm` 和病灶/热点匹配计数。病例宏平均对每个阳性病例等权，体素微平均按病灶体素数加权，病灶宏平均对每个真实连通域等权。空 mask 病例不参与病灶误差平均，但参与热点统计；无定义的比例和误差记录为 `null`，不填零。质心距离只统计已匹配病灶，需与漏灶数同时看。
+全图主指标为 `summary.global_mae`、`global_mse`、`global_psnr`、`global_ssim_axial`，全部按病例等权平均，包含空 mask 病例。MAE/MSE 在完整三维图像（含背景）上计算；PSNR=`10*log10(image_data_range²/MSE)`。`image_data_range` 默认固定为 `5.0`，可通过 `--image-data-range` 设置，各实验必须一致，不能按病例最小值/最大值分别归一化。轴位 SSIM 对第三维的每张二维切片使用 `7×7` 高斯窗口、sigma=1.5、k1=0.01、k2=0.03、有效窗口与总体协方差，再平均切片；定义与训练评价的 `ssim_axial` 一致，使用 NumPy/SciPy 在 CPU 计算，读取已有 NIfTI 不需加载 Torch 或模型。前两维必须至少为 7。完全相同时 PSNR 数学上为正无穷，文件记录为 `null`，汇总另报 `global_psnr_exact_match_cases`，仅对有限值取平均并记录 `global_psnr_valid_cases`。
 
-强度误差默认对参考 PET 截断到 `[0,5]`，预测保持文件中的物理强度，以衔接现有生成指标；`raw_*` 字段另对未截断的参考 PET 计算误差/强度统计，并记录病灶中参考值超过 5 的比例。也可在 JSON 中设 `reference_clip_max=null` 关闭上界截断。旧 VAE 在编码前已截断到 5，不能用新评价恢复已丢失的高 SUV 信息。输入必须是物理强度 NIfTI，不能传入 `[-1,1]` 的 decoder 数据。已被上游截断的预测也无法由脚本还原。
+病灶 SUV 指标在**同一人工 mask 内**分别对真实与预测 PET 计算，不依赖热点是否匹配成功。`per_case.csv` 合并该病例所有病灶体素；`per_lesion.csv` 对每个连通病灶单独计算。SUVmean/SUVmax 使用**原始、未裁剪**参考 PET 和文件中的预测强度，字段及定义如下（`suvmax` 与 `suvmean` 相同）：
+
+| 每病例字段 | 定义 |
+| --- | --- |
+| `lesion_suvmean_reference` / `lesion_suvmean_prediction` | 真实 / 预测 mask 内平均 SUV。 |
+| `lesion_suvmean_absolute_error` | `abs(预测SUVmean−真实SUVmean)`。 |
+| `lesion_suvmean_relative_error_percent` | `100*abs(预测SUVmean−真实SUVmean)/abs(真实SUVmean)`。 |
+| `lesion_suvmean_bias` | `预测SUVmean−真实SUVmean`，负值表示低估。 |
+| `lesion_suvmean_relative_bias_percent` | `100*(预测SUVmean−真实SUVmean)/abs(真实SUVmean)`。 |
+
+汇总前缀 `case_macro_lesion_suvmean_*` / `case_macro_lesion_suvmax_*` 对阳性病例等权；`lesion_macro_suvmean_*` / `lesion_macro_suvmax_*` 对真实连通病灶等权。`*_bias` 的跨病例/病灶均值表示系统性偏差，绝对误差先取绝对值再平均，二者不能互换。百分比也是先逐病例/病灶计算再平均。真实统计量绝对值≤`1e-8` 时相对误差/相对偏差记为 `null`，不纳入百分比均值，每项附带 `*_valid_count`。
+
+另外保留病灶体素误差：`raw_lesion_mae` 为 mask 内逐体素绝对误差的均值，`raw_lesion_mre_percent` 为逐体素绝对百分比误差均值，`raw_lesion_bias` 为逐体素有符号误差均值，`raw_lesion_relative_bias_percent` 为逐体素有符号百分比均值。逐体素相对误差只在 `abs(真实SUV)>1e-8` 上计算，并记录 `raw_lesion_relative_valid_voxels`；这是体素误差，**不同于 SUVmean/SUVmax 的统计量误差**。对应的病例宏平均、体素微平均与病灶宏平均分别以 `case_macro_`、`voxel_micro_`、`lesion_macro_` 开头。
+
+空 mask 病例的 SUV 和病灶强度指标为 `null`，不参与病灶平均，但参与全图和热点统计。此前的病灶回归与热点字段继续输出；质心距离只统计已匹配病灶，需与漏灶数同时看。
+
+全图和旧版病灶回归字段（如 `lesion_mae`）默认对参考 PET 截断到 `[0,5]`，预测保持文件中的物理强度，以衔接现有生成指标；`raw_*` 与新增 `suvmean_*` / `suvmax_*` 字段始终对未截断的参考 PET 计算，并记录病灶中参考值超过 5 的比例。也可在 JSON 中设 `reference_clip_max=null` 关闭全图/旧字段的上界截断（仍将负参考值置零），此时应显式固定适当的 `image_data_range`。旧 VAE 在编码前已截断到 5，不能用新评价恢复已丢失的高 SUV 信息。输入必须是 SUV 单位的 NIfTI，不能传入 `[-1,1]` 的 decoder 数据或尚未转换为 SUV 的活度图像。已被上游截断的预测也无法由脚本还原。报告用 `protocol.metric_version=whole_image_and_raw_suv_v2` 标记本次指标协议，不能直接把新 SUV 指标与旧裁剪病灶 MAE 混为一项。
+
+已有完整预测不需要重新推理：沿用读取已有 PET 的命令，设置一个新的 `--output-dir` 即可重算上述全部指标；需要覆盖旧统计时加 `--overwrite`，不会修改预测图像。
 
 热点是 **预测 PET > `hotspot_threshold`** 的连通域，默认阈值 `2.5`；真实病灶直接取人工 mask，不再以 SUV 阈值裁剪。默认 26 邻接（`connectivity=3`），一对一匹配采用 IoU≥`match_iou`（默认 `0.1`），先最大化有效匹配数量、再最大化 IoU；一个大热点不能重复算作检出多个病灶。`min_hotspot_volume_mm3` 默认 `0`（不过滤），可显式指定固定的最小热点体积。
 

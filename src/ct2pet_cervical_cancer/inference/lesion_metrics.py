@@ -1,9 +1,15 @@
-"""PET error inside manual lesions and explicitly threshold-based hotspot matching."""
+"""Whole-volume image quality, manual-lesion SUV accuracy and hotspot matching."""
 from dataclasses import dataclass
 import math
 import numpy as np
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
+
+
+SUV_RELATIVE_EPSILON = 1e-8
+SUV_METRIC_KEYS = tuple(f"{name}_{stat}" for name in ("suvmean", "suvmax")
+                        for stat in ("reference", "prediction", "absolute_error",
+                                     "relative_error_percent", "bias", "relative_bias_percent"))
 
 
 @dataclass(frozen=True)
@@ -13,6 +19,7 @@ class LesionMetricConfig:
     match_iou: float = 0.1
     min_hotspot_volume_mm3: float = 0.0
     connectivity: int = 3
+    image_data_range: float = 5.0
 
     def __post_init__(self):
         if self.reference_clip_max is not None and (
@@ -28,6 +35,8 @@ class LesionMetricConfig:
             raise ValueError("min_hotspot_volume_mm3 must be finite and nonnegative")
         if self.connectivity not in (1, 2, 3):
             raise ValueError("connectivity must be 1, 2 or 3 (6, 18 or 26 neighbors)")
+        if not math.isfinite(self.image_data_range) or self.image_data_range <= 0:
+            raise ValueError("image_data_range must be finite and positive")
 
 
 def regression_metrics(prediction: np.ndarray, target: np.ndarray) -> dict:
@@ -40,6 +49,71 @@ def regression_metrics(prediction: np.ndarray, target: np.ndarray) -> dict:
             "bias": float(np.mean(difference)), "reference_mean": float(np.mean(target)),
             "prediction_mean": float(np.mean(prediction)), "reference_max": float(np.max(target)),
             "prediction_max": float(np.max(prediction))}
+
+
+def volume_metrics(prediction: np.ndarray, target: np.ndarray, data_range: float) -> dict:
+    """Axial Gaussian SSIM with the same definition as training (7x7, sigma=1.5).
+
+    Use valid windows and population covariance, then average over all axial slices.
+    SciPy keeps evaluation of existing NIfTI files independent of Torch/CUDA.
+    """
+    if min(prediction.shape[:2]) < 7:
+        raise ValueError("PET axial dimensions must be >=7 for SSIM")
+    p, t = prediction.astype(np.float64), target.astype(np.float64)
+    difference = p - t
+    mse = float(np.mean(difference ** 2))
+    coordinates = np.arange(-3, 4, dtype=np.float64)
+    kernel = np.exp(-coordinates ** 2 / (2 * 1.5 ** 2))
+    kernel /= kernel.sum()
+
+    def local_mean(plane):
+        # The outer three pixels are discarded, so boundary padding is irrelevant.
+        filtered = ndimage.correlate1d(plane, kernel, axis=0)
+        return ndimage.correlate1d(filtered, kernel, axis=1)[3:-3, 3:-3]
+
+    scores = []
+    c1, c2 = (.01 * data_range) ** 2, (.03 * data_range) ** 2
+    for z in range(p.shape[2]):
+        x, y = p[:, :, z], t[:, :, z]
+        mx, my = local_mean(x), local_mean(y)
+        vx, vy = local_mean(x * x) - mx * mx, local_mean(y * y) - my * my
+        covariance = local_mean(x * y) - mx * my
+        ssim = ((2 * mx * my + c1) * (2 * covariance + c2)
+                / ((mx * mx + my * my + c1) * (vx + vy + c2)))
+        scores.append(float(ssim.mean()))
+    return {"global_mae": float(np.abs(difference).mean()), "global_mse": mse,
+            "global_psnr": 10 * math.log10(data_range ** 2 / mse) if mse > 0 else None,
+            "global_psnr_exact_match": mse == 0, "global_ssim_axial": float(np.mean(scores))}
+
+
+def suv_metrics(prediction: np.ndarray, reference: np.ndarray) -> dict:
+    """SUVmean/max and errors on the same manual ROI, always using raw PET."""
+    result = dict.fromkeys(SUV_METRIC_KEYS)
+    if not prediction.size:
+        return result
+    for name, statistic in (("suvmean", np.mean), ("suvmax", np.max)):
+        actual = float(statistic(reference.astype(np.float64)))
+        generated = float(statistic(prediction.astype(np.float64)))
+        bias = generated - actual
+        denominator = abs(actual)
+        result.update({f"{name}_reference": actual, f"{name}_prediction": generated,
+                       f"{name}_absolute_error": abs(bias), f"{name}_bias": bias,
+                       f"{name}_relative_error_percent": 100 * abs(bias) / denominator
+                           if denominator > SUV_RELATIVE_EPSILON else None,
+                       f"{name}_relative_bias_percent": 100 * bias / denominator
+                           if denominator > SUV_RELATIVE_EPSILON else None})
+    return result
+
+
+def relative_voxel_metrics(prediction: np.ndarray, reference: np.ndarray) -> dict:
+    """Voxelwise raw-PET percentage errors, excluding near-zero reference voxels."""
+    valid = np.abs(reference) > SUV_RELATIVE_EPSILON
+    count = int(valid.sum())
+    relative = ((prediction[valid].astype(np.float64) - reference[valid])
+                / np.abs(reference[valid].astype(np.float64)))
+    return {"mre_percent": float(np.mean(np.abs(relative)) * 100) if count else None,
+            "relative_bias_percent": float(np.mean(relative) * 100) if count else None,
+            "relative_valid_voxels": count}
 
 
 def match_components(iou: np.ndarray, threshold: float) -> list[tuple[int, int]]:
@@ -112,6 +186,8 @@ def evaluate_case(prediction: np.ndarray, reference: np.ndarray, mask: np.ndarra
                "volume_mm3": float(gt_sizes[index] * voxel_mm3),
                **regression_metrics(p, t),
                **{f"raw_{k}": v for k, v in regression_metrics(p, raw).items()},
+               **suv_metrics(p, raw),
+               **{f"raw_{k}": v for k, v in relative_voxel_metrics(p, raw).items()},
                "centroid_x_mm": float(gt_centers[index][0]),
                "centroid_y_mm": float(gt_centers[index][1]),
                "centroid_z_mm": float(gt_centers[index][2]),
@@ -139,8 +215,9 @@ def evaluate_case(prediction: np.ndarray, reference: np.ndarray, mask: np.ndarra
     row = {"lesion_voxels": int(mask.sum()), "lesion_volume_mm3": float(mask.sum() * voxel_mm3),
            **{f"lesion_{k}": v for k, v in lesion_metrics.items()},
            **{f"raw_lesion_{k}": v for k, v in regression_metrics(prediction[mask], reference[mask]).items()},
-           "global_mae": float(np.abs(prediction.astype(np.float64) - target).mean()),
-           "global_mse": float(np.square(prediction.astype(np.float64) - target).mean()),
+           **{f"lesion_{k}": v for k, v in suv_metrics(prediction[mask], reference[mask]).items()},
+           **{f"raw_lesion_{k}": v for k, v in relative_voxel_metrics(prediction[mask], reference[mask]).items()},
+           **volume_metrics(prediction, target, config.image_data_range),
            "lesion_count": n_gt, "hotspot_count": n_pred, "matched_lesions": tp,
            "missed_lesions": n_gt - tp, "unmatched_hotspots": n_pred - tp,
            "hotspot_lesion_recall": tp / n_gt if n_gt else None,
@@ -166,6 +243,11 @@ def summarize(cases: list[dict], lesions: list[dict]) -> dict:
               "matched_lesions": sum(row["matched_lesions"] for row in cases),
               "missed_lesions": sum(row["missed_lesions"] for row in cases),
               "unmatched_hotspots": sum(row["unmatched_hotspots"] for row in cases)}
+    for key in ("global_mae", "global_mse", "global_psnr", "global_ssim_axial"):
+        values = [row[key] for row in cases if row.get(key) is not None]
+        result[key] = float(np.mean(values)) if values else None
+        result[f"{key}_valid_cases"] = len(values)
+    result["global_psnr_exact_match_cases"] = sum(bool(row.get("global_psnr_exact_match")) for row in cases)
     for key in ("lesion_mae", "lesion_mse", "lesion_rmse", "lesion_bias", "raw_lesion_mae", "raw_lesion_bias"):
         result[f"case_macro_{key}"] = float(np.mean([r[key] for r in positive])) if positive else None
     for key in ("lesion_mae", "lesion_mse", "lesion_bias", "raw_lesion_mae"):
@@ -175,6 +257,24 @@ def summarize(cases: list[dict], lesions: list[dict]) -> dict:
     for key in ("mae", "mse", "bias", "centroid_distance_mm"):
         values = [row[key] for row in lesions if row[key] is not None]
         result[f"lesion_macro_{key}"] = float(np.mean(values)) if values else None
+    for prefix, records in (("case_macro_lesion_", positive), ("lesion_macro_", lesions)):
+        for key in SUV_METRIC_KEYS:
+            source = f"lesion_{key}" if prefix.startswith("case_") else key
+            values = [row[source] for row in records if row.get(source) is not None]
+            result[prefix + key] = float(np.mean(values)) if values else None
+            result[prefix + key + "_valid_count"] = len(values)
+    for suffix in ("mre_percent", "relative_bias_percent"):
+        for prefix, records, source in (
+                ("case_macro_raw_lesion_", positive, "raw_lesion_" + suffix),
+                ("lesion_macro_raw_", lesions, "raw_" + suffix)):
+            values = [row[source] for row in records if row.get(source) is not None]
+            result[prefix + suffix] = float(np.mean(values)) if values else None
+            result[prefix + suffix + "_valid_count"] = len(values)
+        count = sum(row.get("raw_lesion_relative_valid_voxels", 0) for row in positive)
+        result["voxel_micro_raw_lesion_" + suffix] = (
+            sum(row["raw_lesion_" + suffix] * row["raw_lesion_relative_valid_voxels"]
+                for row in positive if row.get("raw_lesion_" + suffix) is not None) / count if count else None)
+    result["raw_lesion_relative_valid_voxels"] = sum(row.get("raw_lesion_relative_valid_voxels", 0) for row in positive)
     tp, n_gt, n_pred = result["matched_lesions"], result["lesion_count"], result["hotspot_count"]
     result.update(hotspot_lesion_recall=tp / n_gt if n_gt else None,
                   hotspot_lesion_precision=tp / n_pred if n_pred else None,

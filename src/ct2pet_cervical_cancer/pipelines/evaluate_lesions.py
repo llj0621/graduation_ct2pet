@@ -10,7 +10,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 
-from ..inference.lesion_metrics import LesionMetricConfig, evaluate_case, summarize
+from ..inference.lesion_metrics import SUV_RELATIVE_EPSILON, LesionMetricConfig, evaluate_case, summarize
 from ..utils.cli import parse_config_args
 
 
@@ -22,6 +22,8 @@ def parse_args():
     parser.add_argument("--split", choices=("test", "validation"), default="test")
     parser.add_argument("--prediction-name", default="pet_prediction.nii.gz")
     parser.add_argument("--reference-clip-max", type=float, default=5.0)
+    parser.add_argument("--image-data-range", type=float, default=5.0,
+                        help="Fixed intensity range for global PSNR/SSIM; never inferred per case.")
     parser.add_argument("--hotspot-threshold", type=float, default=2.5)
     parser.add_argument("--match-iou", type=float, default=.1)
     parser.add_argument("--min-hotspot-volume-mm3", type=float, default=0.0)
@@ -149,7 +151,8 @@ def evaluate(args) -> dict:
     if args.checkpoint is not None and args.input_root is None:
         raise ValueError("input_root is required when generating from a checkpoint")
     metric_config = LesionMetricConfig(args.reference_clip_max, args.hotspot_threshold, args.match_iou,
-                                       args.min_hotspot_volume_mm3, args.connectivity)
+                                       args.min_hotspot_volume_mm3, args.connectivity,
+                                       image_data_range=args.image_data_range)
     payload = json.loads(args.split_manifest.read_text(encoding="utf-8-sig"))
     records = payload.get("records", [])
     seen = set()
@@ -229,15 +232,27 @@ def evaluate(args) -> dict:
         hotspots.extend(dict(case=case, **r) for r in hotspot_rows)
     summary = summarize(cases, lesions)
     summary.update(requested_cases=len(selected), skipped_cases=len(skipped), complete_split=not skipped)
-    protocol = {"split": args.split, "split_manifest_sha256": sha256(args.split_manifest),
+    protocol = {"metric_version": "whole_image_and_raw_suv_v2",
+                "split": args.split, "split_manifest_sha256": sha256(args.split_manifest),
                 "case_names": [row["case"] for row in cases], "metric_config": asdict(metric_config),
                 "generation": generator.provenance if generator else None,
                 "prediction_clipped_by_evaluator": False,
+                "global_metrics": {"reference_clip_max": metric_config.reference_clip_max,
+                    "data_range": metric_config.image_data_range, "aggregation": "equal-weight case mean",
+                    "ssim": "axial 2D slice mean; Gaussian 7x7 sigma=1.5; valid windows; population covariance; k1=.01 k2=.03",
+                    "psnr_exact_match": "null (+infinity); excluded from finite PSNR mean and counted separately"},
+                "suv_metrics": {"reference": "original PET, without clipping", "prediction": "without clipping",
+                    "region": "same manual lesion mask in reference and prediction; all lesions regardless of hotspot matching",
+                    "bias": "prediction - reference; systematic bias is the mean signed difference across cases/lesions",
+                    "relative_error_percent": "100 * abs(prediction_statistic - reference_statistic) / abs(reference_statistic)",
+                    "relative_bias_percent": "100 * (prediction_statistic - reference_statistic) / abs(reference_statistic)",
+                    "relative_zero_epsilon": SUV_RELATIVE_EPSILON,
+                    "near_zero_reference": "relative error/bias null; excluded from percentage means, valid counts reported"},
                 "matching": "one-to-one; maximize eligible IoU matches, then total IoU",
                 "notes": ["Hotspots are thresholded uptake, not semantic tumor segmentations.",
                           "Unmatched hotspots may be physiological uptake; use a predefined evaluation mask for exclusions.",
                           "Unknown NIfTI spatial units are assumed to be millimeters.",
-                          "Default intensity errors use reference clipped to [0,5]; raw_* metrics use original reference values.",
+                          "Global and legacy lesion regression errors follow reference_clip_max; raw_* and suvmean/suvmax always use original reference values.",
                           "Hotspot threshold and IoU settings are exploratory and must be fixed before comparing test results."]}
     result = {"summary": summary, "protocol": protocol, "skipped": skipped,
               "cases": cases, "lesions": lesions, "hotspots": hotspots}
