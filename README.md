@@ -395,11 +395,11 @@ uv run python scripts/infer_ct2pet.py --case 101020072771 --no-decode
 uv run python scripts/decode_pet.py --input-root outputs/ct2pet/predictions --latent-name pet_pred.pt --case 101020072771 --no-quantize
 ```
 
-### 独立病灶评价（完整测试集）
+### 独立病灶评价
 
 入口为 `scripts/evaluate_lesions.py`，配置为 `configs/evaluate_lesions.json`，也可运行 `uv run ct2pet-evaluate-lesions`。先执行 `uv sync` 安装新增的 SciPy 依赖。脚本独立于训练运行，不改变训练 loss 或 checkpoint 选择，不自动上传 W&B。
 
-默认从训练保存的 `split.json` 中读取 **全部 test 病例**，只读取所选 split。文件对应关系如下：
+默认从训练保存的 `split.json` 中读取 **全部 test 病例**。可用 `--split train` 评价训练集，或用 `--split validation` 评价验证集。脚本只读取所选划分的病例。文件对应关系如下：
 
 ```text
 reference_root/<case>/pet.nii.gz          # 原始物理强度 PET

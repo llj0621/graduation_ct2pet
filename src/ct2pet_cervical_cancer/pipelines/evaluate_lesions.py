@@ -19,7 +19,7 @@ def parse_args():
     for name in ("split-manifest", "reference-root", "mask-root", "prediction-root", "output-dir",
                  "evaluation-mask-root", "checkpoint", "input-root", "pet-checkpoint"):
         parser.add_argument(f"--{name}", type=Path, default=None)
-    parser.add_argument("--split", choices=("test", "validation"), default="test")
+    parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
     parser.add_argument("--prediction-name", default="pet_prediction.nii.gz")
     parser.add_argument("--reference-clip-max", type=float, default=5.0)
     parser.add_argument("--image-data-range", type=float, default=5.0,
